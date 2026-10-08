@@ -1,0 +1,8 @@
+{
+  "name": "voice",
+  "version": "0.2.0",
+  "description": "Voice front desk for Claude Code on Windows: an OpenAI realtime voice (through codex app-server and a ChatGPT login) hands work to this session and speaks the answer; voice turns are guarded",
+  "author": { "name": "ldk00315-jpg" },
+  "license": "MIT",
+  "keywords": ["voice", "realtime", "codex", "windows", "mod"]
+}

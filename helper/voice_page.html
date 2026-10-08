@@ -1,0 +1,370 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voice Mod</title>
+<style>
+  :root { --bg:#f7f6f2; --fg:#222; --muted:#666; --card:#fff; --line:#ddd; --accent:#2f6fde; --ok:#1f8a4c; --bad:#c0392b; --row:#f0efe9; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#1b1b1d; --fg:#eee; --muted:#aaa; --card:#26262a; --line:#3a3a40; --accent:#6c9bff; --ok:#4cc27e; --bad:#ff6b5b; --row:#2c2c31; }
+  }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.6 system-ui, "Segoe UI", "Yu Gothic UI", sans-serif; }
+  main { max-width:760px; margin:0 auto; padding:16px; }
+  h1 { font-size:20px; margin:4px 0 12px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px 14px; margin-bottom:12px; }
+  button { font:inherit; padding:8px 16px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--fg); cursor:pointer; }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  button:disabled { opacity:.5; cursor:default; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  #state { font-weight:600; }
+  .ok { color:var(--ok); } .bad { color:var(--bad); } .muted { color:var(--muted); font-size:13px; }
+  #log { list-style:none; padding:0; margin:0; max-height:50vh; overflow:auto; }
+  #log li { padding:4px 8px; border-radius:4px; word-break:break-word; }
+  #log li:nth-child(even) { background:var(--row); }
+  .who { font-weight:600; margin-right:6px; }
+  input[type=text] { flex:1; min-width:180px; font:inherit; padding:7px 10px; border-radius:8px; border:1px solid var(--line); background:var(--bg); color:var(--fg); }
+  select { font:inherit; padding:7px 10px; border-radius:8px; border:1px solid var(--line); background:var(--bg); color:var(--fg); min-width:150px; }
+  .voiceinfo { display:flex; gap:16px; flex-wrap:wrap; margin-top:6px; }
+  #meter { height:6px; background:var(--line); border-radius:3px; overflow:hidden; margin-top:8px; }
+  #meter div { height:100%; width:0; background:var(--ok); transition:width .1s; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Voice Mod</h1>
+  <div class="card">
+    <div class="row">
+      <label for="label">Thread name:</label>
+      <input id="label" type="text" maxlength="60" placeholder="Name of the Claude Code thread this window talks to">
+      <button id="saveLabel">Rename</button>
+      <span id="labelMsg" class="muted"></span>
+    </div>
+  </div>
+  <div class="card">
+    <div class="row">
+      <label for="voice">Voice:</label>
+      <select id="voice" disabled><option>Loading…</option></select>
+      <button id="preview" disabled>Preview</button>
+      <span id="voiceMsg" class="muted"></span>
+    </div>
+    <div class="voiceinfo muted">
+      <span>Next voice: <b id="nextVoice">-</b></span>
+      <span>Voice in use: <b id="activeVoice">none</b></span>
+    </div>
+    <p class="muted">The chosen voice is saved in <span id="settingsPath">settings.json</span> and used next time too (a --voice given at startup wins). The voice cannot change in the middle of a conversation, so it is locked while one runs. Preview does not use the microphone.</p>
+  </div>
+  <div class="card">
+    <div class="row">
+      <button id="start" class="primary" disabled>Start (uses the microphone)</button>
+      <button id="stop" disabled>Stop</button>
+      <button id="mute" disabled>Mute</button>
+      <span>State: <span id="state">idle</span></span>
+    </div>
+    <div id="meter"><div></div></div>
+    <p class="muted">A headset is recommended. Echo cancellation is left to the browser (echoCancellation).</p>
+  </div>
+  <div class="card">
+    <div class="row">
+      <input id="text" type="text" placeholder="Type to talk (sent instead of speech)">
+      <button id="send" disabled>Send</button>
+    </div>
+  </div>
+  <div class="card"><ul id="log"></ul></div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+let pc = null, mic = null, lastSeq = 0, polling = null, meterTimer = null, dcTimer = null, audioCtx = null;
+let mode = 'idle';      // 'idle' | 'starting' | 'conversation' | 'preview'
+let voiceInfo = null;   // GET /voices
+let preview = null;     // { since, sentAt, replied, quietSince, timer, retried }
+let dcSeen = {};        // data channel event types seen in the current session
+let dcWaiters = [];     // [{ type, resolve }]
+function waitDc(type, ms) {  // resolves true when the event arrived, false after ms
+  if (dcSeen[type]) return Promise.resolve(true);
+  return new Promise(res => {
+    const w = { type, resolve: res }; dcWaiters.push(w);
+    setTimeout(() => { dcWaiters = dcWaiters.filter(x => x !== w); res(false); }, ms);
+  });
+}
+const SOURCE_LABEL = { cli:'--voice', settings:'saved', default:'codex default' };
+
+function setState(text, cls) { const s = $('state'); s.textContent = text; s.className = cls || ''; }
+function addLog(who, text) {
+  const li = document.createElement('li');
+  const w = document.createElement('span'); w.className = 'who'; w.textContent = who;
+  li.append(w, document.createTextNode(text));
+  $('log').append(li); $('log').scrollTop = $('log').scrollHeight;
+}
+async function post(path, body) {
+  const r = await fetch(path, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body || {}) });
+  return r.json();
+}
+function setActive(voice, purpose) {
+  $('activeVoice').textContent = voice ? voice + (purpose === 'preview' ? ' (preview)' : '') : 'none';
+}
+
+function refreshButtons() {
+  const idle = mode === 'idle';
+  $('start').disabled = !idle;
+  $('preview').disabled = !idle || !voiceInfo;
+  $('voice').disabled = !idle || !voiceInfo;
+  $('stop').disabled = idle || mode === 'starting';
+}
+
+function showVoiceInfo(j) {
+  voiceInfo = j;
+  const sel = $('voice'); sel.textContent = '';
+  for (const v of j.voices) {
+    const o = document.createElement('option'); o.value = v;
+    o.textContent = v + (v === j.default ? ' (default)' : '');
+    sel.append(o);
+  }
+  if (j.selected && !j.voices.includes(j.selected)) {
+    const o = document.createElement('option'); o.value = j.selected; o.textContent = j.selected + ' (--voice)'; sel.append(o);
+  }
+  sel.value = j.selected || j.default;
+  $('nextVoice').textContent = sel.value + ' (' + (SOURCE_LABEL[j.source] || j.source || '') + ')';
+  if (j.settingsPath) $('settingsPath').textContent = j.settingsPath;
+  setActive(j.active, j.purpose);
+  $('voiceMsg').textContent = j.fromCodex ? '' : '(codex did not return a voice list; showing a built-in list)';
+  refreshButtons();
+}
+
+async function loadVoices() {
+  try { const r = await fetch('/voices'); showVoiceInfo(await r.json()); }
+  catch (e) { $('voiceMsg').textContent = 'Could not load the voice list'; mode = 'idle'; $('start').disabled = false; }
+}
+
+$('voice').onchange = async () => {
+  const voice = $('voice').value;
+  $('voiceMsg').textContent = 'Saving…';
+  const r = await post('/settings', { voice }).catch(e => ({ ok:false, error:String(e) }));
+  if (r.ok) { showVoiceInfo(r); $('voiceMsg').textContent = 'Saved'; }
+  else { $('voiceMsg').textContent = 'Could not save: ' + (r.error || ''); }
+};
+
+// Thread name: shown before "Voice Mod" in the window title and the heading.
+function showLabel(label) {
+  const prefix = label ? '[' + label + '] ' : '';
+  document.title = prefix + 'Voice Mod';
+  document.querySelector('h1').textContent = prefix + 'Voice Mod';
+  if (document.activeElement !== $('label')) $('label').value = label || '';
+}
+async function loadLabel() {
+  try { const j = await (await fetch('/health')).json(); showLabel(j.label || ''); } catch (e) {}
+}
+async function saveLabel() {
+  const label = $('label').value.trim();
+  if (!label) { $('labelMsg').textContent = 'Enter a name'; return; }
+  const r = await post('/label', { label }).catch(e => ({ ok:false, error:String(e) }));
+  if (!r.ok) { $('labelMsg').textContent = 'Could not rename: ' + (r.error || ''); return; }
+  $('label').blur(); showLabel(r.label);
+  $('labelMsg').textContent = r.appliesToVoice === 'now' ? 'Renamed'
+    : 'Renamed (the voice assistant uses the new name from the next Start)';
+}
+$('saveLabel').onclick = saveLabel;
+$('label').onkeydown = e => { if (e.key === 'Enter') saveLabel(); };
+
+async function poll() {
+  try {
+    const r = await fetch('/events?since=' + lastSeq); const j = await r.json();
+    for (const e of j.events) {
+      lastSeq = Math.max(lastSeq, e.seq);
+      if (e.type === 'transcript') {
+        addLog(e.role === 'user' ? 'You' : (preview ? 'AI (preview)' : 'AI'), e.text);
+        if (preview && preview.sentAt && e.role === 'assistant' && e.seq > preview.since) preview.replied = Date.now();
+      }
+      else if (e.type === 'voice') {
+        if (e.event === 'active') setActive(e.voice, e.purpose);
+      }
+      else if (e.type === 'realtime') {
+        if (e.state === 'error') { setState('error', 'bad'); addLog('Error', e.message || ''); }
+        else if (e.state === 'closed') {
+          setActive(null);
+          if (preview) finishPreview('closed');
+          else if (mode === 'conversation') setState('disconnected (' + (e.reason || '') + ')', 'bad');
+        }
+        else if (e.state === 'started') addLog('Info', 'realtime started, version=' + e.version);
+      }
+      else if (e.type === 'request') addLog('Request → Claude', e.text);
+      else if (e.type === 'answer_delivered') addLog('Result → speech', (e.via || '') + (e.status && e.status !== 'ok' ? ' (' + e.status + ')' : ''));
+      else if (e.type === 'answer_undelivered') addLog('Result not delivered', e.error || '');
+      else if (e.type === 'codex_turn') addLog('codex', 'turn ' + e.event);
+    }
+  } catch (_) { /* helper gone */ }
+}
+
+function waitIce(pc, ms) {
+  if (pc.iceGatheringState === 'complete') return Promise.resolve();
+  return new Promise(res => {
+    const t = setTimeout(res, ms);
+    pc.addEventListener('icegatheringstatechange', () => { if (pc.iceGatheringState === 'complete') { clearTimeout(t); res(); } });
+  });
+}
+
+// Level meter. Conversation: the mic. Preview: the model's voice (used to wait until it finishes).
+function startMeter(stream) {
+  const ctx = audioCtx || (audioCtx = new AudioContext());
+  const src = ctx.createMediaStreamSource(stream);
+  const an = ctx.createAnalyser(); an.fftSize = 512; src.connect(an);
+  const buf = new Uint8Array(an.fftSize);
+  if (meterTimer) clearInterval(meterTimer);
+  meterTimer = setInterval(() => {
+    an.getByteTimeDomainData(buf); let peak = 0;
+    for (const v of buf) peak = Math.max(peak, Math.abs(v - 128));
+    $('meter').firstChild.style.width = Math.min(100, peak / 128 * 300) + '%';
+    if (preview) previewTick(peak);
+  }, 100);
+}
+
+// Shared WebRTC setup. sendTrack = mic (conversation) or a silent WebAudio track (preview).
+async function connect(sendTrack, sendStream, purpose, onConnected) {
+  pc = new RTCPeerConnection();
+  pc.addTrack(sendTrack, sendStream);
+  const dc = pc.createDataChannel('oai-events');
+  const dcTypes = {};
+  dcSeen = {}; dcWaiters = [];
+  dc.onmessage = ev => {
+    try {
+      const t = JSON.parse(ev.data).type || '?'; dcTypes[t] = (dcTypes[t] || 0) + 1; dcSeen[t] = true;
+      const ready = dcWaiters.filter(w => w.type === t); dcWaiters = dcWaiters.filter(w => w.type !== t);
+      ready.forEach(w => w.resolve(true));
+    } catch (_) {}
+  };
+  dcTimer = setInterval(() => { if (Object.keys(dcTypes).length) post('/client-state', { state:'datachannel', purpose, types: dcTypes }).catch(() => {}); }, 15000);
+  const audio = new Audio(); audio.autoplay = true;
+  pc.ontrack = ev => {
+    const stream = ev.streams[0] || new MediaStream([ev.track]);
+    audio.srcObject = stream; audio.play().catch(() => {});
+    if (purpose === 'preview') startMeter(stream);
+  };
+  const myPc = pc;
+  pc.onconnectionstatechange = () => {
+    if (pc !== myPc) return;
+    const s = myPc.connectionState;
+    post('/client-state', { state: s }).catch(() => {});
+    if (s === 'connected') onConnected();
+    else if (s === 'failed' || s === 'disconnected') {
+      setState('media lost: ' + s, 'bad');
+      if (preview) finishPreview('media lost');
+    }
+  };
+  await pc.setLocalDescription(await pc.createOffer());
+  await waitIce(pc, 2500);
+  setState('connecting to codex…');
+  const r = await post('/offer', { sdp: pc.localDescription.sdp, voice: $('voice').value, purpose });
+  if (!r.ok) throw new Error(r.error || 'offer failed');
+  if (pc !== myPc) throw new Error('cancelled');
+  setActive(r.voice, purpose);
+  await pc.setRemoteDescription({ type:'answer', sdp: r.sdp });
+}
+
+$('start').onclick = async () => {
+  if (mode !== 'idle') return;
+  mode = 'starting'; refreshButtons(); setState('preparing the microphone…');
+  try {
+    mic = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation:true, noiseSuppression:true, autoGainControl:true } });
+    startMeter(mic);
+    const voice = $('voice').value;
+    await connect(mic.getAudioTracks()[0], mic, 'conversation', () => {
+      setState('connected: go ahead and talk (voice: ' + voice + ')', 'ok'); $('send').disabled = false;
+    });
+    mode = 'conversation'; refreshButtons(); $('mute').disabled = false;
+  } catch (e) {
+    setState('failed', 'bad'); addLog('Error', String(e && e.message || e));
+    await post('/stop').catch(() => {});
+    cleanup();
+  }
+};
+
+// Preview: getUserMedia is never called. The only outgoing track is silence made by WebAudio.
+// Ends when the assistant transcript arrived and the voice went quiet, or after 15 s.
+$('preview').onclick = async () => {
+  if (mode !== 'idle' || !voiceInfo) return;
+  mode = 'preview'; refreshButtons();
+  const voice = $('voice').value;
+  setState('preparing preview… (' + voice + ')');
+  addLog('Preview', 'asking for a short self-introduction in ' + voice);
+  const p = preview = { since: lastSeq, sentAt: 0, replied: 0, quietSince: 0, timer: null };
+  p.timer = setTimeout(() => finishPreview('timed out'), 35000);  // covers a slow connect too
+  try {
+    audioCtx = audioCtx || new AudioContext();
+    await audioCtx.resume().catch(() => {});
+    const silent = audioCtx.createMediaStreamDestination();  // nothing connected to it = silence
+    await connect(silent.stream.getAudioTracks()[0], silent.stream, 'preview', async () => {
+      if (preview !== p || p.sentAt || p.connected) return;
+      p.connected = true;
+      setState('previewing… (' + voice + ')', 'ok');
+      // Bug fix: the text went out 0.5 s after ICE connected and
+      // the model never answered (data channel: session.started + session.context.appended only),
+      // while the headless self test, which waits 2 s, always got a reply. Wait for the model's
+      // session.started on the data channel, then 1.5 s more, and retry once via appendSpeech.
+      await waitDc('session.started', 5000);
+      await new Promise(res => setTimeout(res, 1500));
+      if (preview !== p) return;
+      p.since = lastSeq; p.sentAt = Date.now();
+      const r = await post('/say', { text: voiceInfo.previewText, mode:'text' }).catch(e => ({ ok:false, error:String(e) }));
+      if (!r.ok) finishPreview('send failed: ' + (r.error || ''));
+    });
+  } catch (e) {
+    addLog('Error', String(e && e.message || e));
+    finishPreview('failed');
+  }
+};
+
+// Every 100 ms with the output peak while previewing.
+function previewTick(peak) {
+  const p = preview; if (!p || !p.sentAt) return;
+  const now = Date.now();
+  if (peak > 4) p.quietSince = 0; else if (!p.quietSince) p.quietSince = now;
+  if (!p.replied && !p.retried && now - p.sentAt > 6000) {
+    p.retried = true;
+    addLog('Preview', 'no reply yet, sending once more');
+    post('/say', { text: voiceInfo.previewText, mode:'speech' }).catch(() => {});
+  }
+  if (now - p.sentAt > 20000) finishPreview('stopped after 20 s');
+  else if (p.replied && p.quietSince && now - p.quietSince > 1200) finishPreview('');
+  else if (p.replied && now - p.replied > 8000) finishPreview('');
+}
+
+async function finishPreview(why) {
+  if (!preview) return;
+  const p = preview; preview = null;
+  if (p.timer) clearTimeout(p.timer);
+  cleanup();
+  await post('/stop').catch(() => {});
+  setState(why ? 'preview finished (' + why + ')' : 'preview finished', why ? 'bad' : '');
+  setActive(null);
+}
+
+function cleanup() {
+  if (pc) { pc.close(); pc = null; }
+  if (mic) { mic.getTracks().forEach(t => t.stop()); mic = null; }
+  if (meterTimer) { clearInterval(meterTimer); meterTimer = null; }
+  if (dcTimer) { clearInterval(dcTimer); dcTimer = null; }
+  $('meter').firstChild.style.width = '0';
+  $('mute').disabled = true; $('send').disabled = true; $('mute').textContent = 'Mute';
+  mode = 'idle'; refreshButtons();
+}
+
+$('stop').onclick = async () => {
+  if (preview) { finishPreview('stopped'); return; }
+  cleanup(); await post('/stop').catch(() => {}); setState('stopped'); setActive(null);
+};
+$('mute').onclick = () => {
+  if (!mic) return; const t = mic.getAudioTracks()[0]; t.enabled = !t.enabled;
+  $('mute').textContent = t.enabled ? 'Mute' : 'Unmute';
+};
+$('send').onclick = async () => {
+  const text = $('text').value.trim(); if (!text) return;
+  addLog('You (text)', text); $('text').value = '';
+  const r = await post('/say', { text, mode:'text' }).catch(e => ({ ok:false, error:String(e) }));
+  if (!r.ok) addLog('Error', r.error || '');
+};
+$('text').addEventListener('keydown', e => { if (e.key === 'Enter') $('send').click(); });
+window.addEventListener('beforeunload', () => { navigator.sendBeacon && navigator.sendBeacon('/stop', new Blob(['{}'], { type:'application/json' })); });
+polling = setInterval(poll, 500); poll(); loadVoices(); loadLabel();
+</script>
+</body>
+</html>

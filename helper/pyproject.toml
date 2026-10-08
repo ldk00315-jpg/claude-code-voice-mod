@@ -1,0 +1,14 @@
+[project]
+name = "claude-voice-helper"
+version = "0.1.0"
+description = "Voice helper for the Claude Code voice plugin: codex app-server realtime (ChatGPT auth, WebRTC) with a local Edge page as the audio endpoint"
+requires-python = ">=3.11,<3.14"
+# The helper itself is stdlib only (the browser does the audio).
+dependencies = []
+
+[dependency-groups]
+# Only for the headless self test (--selftest-text): a silent aiortc peer, no microphone.
+selftest = ["aiortc>=1.15,<2"]
+
+[tool.uv]
+package = false

@@ -1,0 +1,18 @@
+# runtime data (the helper keeps it in %LOCALAPPDATA%\claude-code-voice-mod, but never commit it)
+logs/
+*.log
+*.jsonl
+helper/settings.json
+settings.json
+!helper/settings.example.json
+.codex-cwd/
+codex-cwd/
+
+# environments and caches
+.venv/
+__pycache__/
+*.pyc
+node_modules/
+
+# written by Claude Code when it loads the plugin from this folder
+.claude-plugin/types/
