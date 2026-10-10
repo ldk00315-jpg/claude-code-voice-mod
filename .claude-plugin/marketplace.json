@@ -6,6 +6,7 @@
     {
       "name": "voice",
       "source": "./",
+      "version": "0.3.0",
       "description": "Voice front desk for Claude Code on Windows (codex realtime + ChatGPT login)"
     }
   ]

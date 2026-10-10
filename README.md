@@ -2,7 +2,7 @@
 
 [日本語版 README](README.ja.md)
 
-Talk to your Claude Code session by voice on Windows.
+Talk to your Claude Code session by voice on Windows. Version 0.3.0 ([CHANGELOG](CHANGELOG.md)).
 
 This is a Claude Code **Mod** (a plugin made of function hooks) plus a small Python helper.
 A realtime voice model from OpenAI, reached through `codex app-server` with your ChatGPT
@@ -27,8 +27,11 @@ Claude Code session. When Claude finishes, the voice reads you a one or two sent
 >   and **Claude's answers (trimmed to about 2000 characters, code blocks removed)** are sent to
 >   OpenAI so the voice can summarise them. Anything in those answers, including file contents or
 >   paths Claude mentions, leaves your machine. Secret-looking strings (API keys, tokens, JWTs,
->   private keys, `password = ...` lines, credentials in connection strings, long random strings)
->   are replaced by `[REDACTED]` first, but this is **best effort**: it only knows common formats.
+>   private keys, values of secret-named settings such as `password = 1234`, `"pin": 0000` or
+>   "the password is ...", credentials in connection strings, long random strings) are replaced by
+>   `[REDACTED]` first, but this is **best effort**: it only knows common formats and cannot
+>   recognise every secret or piece of personal information. Your microphone audio goes from the
+>   page to OpenAI directly and is never redacted.
 > - **Voice can misfire.** Background speech, a TV, or a misheard phrase can become a request to
 >   Claude. Voice requests run **with the same permissions as your Claude Code session**.
 > - **The guard is not a sandbox.** Dangerous actions in voice-originated turns are blocked by a
@@ -76,25 +79,36 @@ Claude Code session. When Claude finishes, the voice reads you a one or two sent
 - The voice model decides between answering itself (small talk) and delegating (anything that
   needs the computer). A delegation arrives as a `handoff_request`; codex is told to do nothing and
   its turn is interrupted at once, so **Claude Code is the only worker**.
-- codex is started with `read-only` sandbox, `approval_policy="never"`, web search off, your
-  configured MCP servers disabled and features such as apps, plugins, computer use and browser use
-  disabled. MCP servers are turned off per name, twice: `-c mcp_servers.<name>.enabled=false` for
-  the servers in `config.toml` (`%CODEX_HOME%` or `~/.codex`, read only, never modified), then a
-  thread-level override for every server the effective config (`config/read`, all layers) still
-  has enabled. codex merges `-c` tables, so one override cannot empty the whole list. If an MCP
-  server still starts, the helper logs a WARN and prints an `mcp_warning` line. Any approval
-  request from codex is declined.
-- The local HTTP server accepts only `Host`/`Origin` of its own `127.0.0.1:<port>` and needs a
-  random per-run token (`X-Voice-Token`) on every call except loading the page; the token is in
-  the helper's `ready` line for the plugin and embedded in the page it serves. No CORS headers are
-  sent, so other web pages cannot read it.
+- codex is started with `read-only` sandbox, `approval_policy="never"`, web search off, and
+  features such as apps, plugins, computer use and browser use disabled. Any approval request from
+  codex is declined.
+- **MCP isolation (what is enforced).** Every MCP server codex knows of is disabled by name, at two
+  stages: one `-c mcp_servers={"<name>"={enabled=false}, ...}` override for the servers in
+  `config.toml` (`%CODEX_HOME%` or `~/.codex`, read only, never modified), then a thread/start
+  override naming every server in the effective config (`config/read`, all layers). Names with dots
+  or other special characters (`corp.files`, `service@home`) are covered. The helper then
+  **requires** that `config/read` and the MCP status list (`mcpServerStatus/list`) both succeed and
+  that every listed server is `disabled`; otherwise it refuses to start (an `mcp_blocked` line, a
+  toast and the status line say why). If any MCP server reports a startup later, the realtime
+  session is stopped and new ones are refused, and the page shows a red "Voice is blocked" notice.
+  This checks what codex reports; it is not a sandbox around codex.
+- The local HTTP server accepts only `Host`/`Origin` of its own `127.0.0.1:<port>`. The page is
+  served only through a **one-time link** (`/?k=...`) that the helper opens Edge with; the page
+  removes it from the address bar, and `/voice page` opens a fresh one. Every other call needs a
+  random per-run token (`X-Voice-Token`) that the plugin gets from the helper's `ready` line and
+  the page carries. No CORS headers are sent. Answers are accepted only for requests the helper
+  itself sent in the current realtime session. Bodies are size-limited and type-checked, reads time
+  out, and at most 8 requests are handled at once.
+- **Out of scope:** other programs running as the same Windows user. They can read the token and
+  the link from process memory or command lines, so this design does not protect against them.
 - More detail: [docs/how-it-works.md](docs/how-it-works.md).
 
 ## Requirements
 
 - Windows 10 or 11 (the helper opens Edge and uses a Windows job object so codex never outlives it).
 - Claude Code **2.1.289 or newer** (desktop app Code tab or CLI) with Mod support. Developed and
-  tested with Claude Code 2.1.289 (live voice tests) and 2.1.293 (`claude plugin validate/test`).
+  tested with Claude Code 2.1.289 (live voice tests) and 2.1.293; 0.3.0 (which keeps the guard in
+  `$.state`) was checked with 2.1.295 (`claude plugin validate/test`).
 - Microsoft Edge (the voice page runs as an Edge app window).
 - [uv](https://docs.astral.sh/uv/) on `PATH` (it runs the helper; Python 3.11 to 3.13 is fetched
   automatically if needed). The helper uses the standard library only.
@@ -135,6 +149,7 @@ Check: `/voice status` should answer `voice: stopped`.
 | --- | --- |
 | `/voice on [name]` | Starts the helper and opens the voice page. `name` is the thread label (optional). |
 | `/voice off` | Stops the helper (and codex). Also happens when the session ends. |
+| `/voice page` | Opens the voice page again (a fresh one-time link), for example after closing the window. |
 | `/voice status` | Phase, helper port, queued/running voice requests, whether the guard is active. |
 
 On the voice page:
@@ -173,8 +188,14 @@ The helper keeps its data **outside the plugin folder**, in a per-user folder:
 - `settings.json` (voice and persona), `logs\voice-*.log`, `logs\voice-answers.jsonl` (metadata
   only: id, status, length and a short hash, no answer text) and an empty `codex-cwd\` folder
   used as codex's working directory.
-- The log never holds answer bodies (only id, length and a short hash). Transcripts and requests
-  are kept for debugging, with secret-looking strings redacted (best effort).
+- **Conversation logging is off by default.** The log keeps metadata only: states, errors, ids,
+  server names and the length of each text, never what was said, requested or answered. For
+  debugging, start the helper with `--debug-log` or put `"debugLog": true` in `settings.json`: then
+  transcripts and requests are logged too, with secret-looking strings redacted (best effort).
+  Answer bodies are never logged.
+- Retention, applied each time the helper starts: log files older than 7 days are deleted, then
+  the oldest ones until all of them fit in 20 MB; `voice-answers.jsonl` is rotated past 1 MB.
+  To delete everything, remove the `logs` folder while the helper is stopped.
 
 By default the assistant is a **neutral, friendly voice assistant that answers in the language you
 speak** (for example Japanese or English). To give it a character, add a `persona` section to
@@ -237,10 +258,14 @@ Limits:
 - Reading and editing files is allowed. A misheard request can still change files.
 - A turn counts as voice-originated when its prompt carries the voice marker (a line starting
   with `[voice] ` plus the plugin's notice block), or is a text the plugin submitted, whatever
-  happened to the request meanwhile (timed out, `/voice off`). A typed prompt that contains the
-  whole marker (for example a pasted voice prompt) is guarded too: fail-safe by design.
-- The guard's state lives in the module: if the plugin hot-reloads during a voice turn, tracking of
-  that turn is lost (new voice turns are tracked normally).
+  happened to the request meanwhile (timed out, `/voice off`).
+- **A typed prompt that contains the full voice marker** (for example a pasted voice prompt) is
+  guarded too: fail-safe by design. Retype the request without the marker to run it unguarded.
+- The guard's state (the running turn, which subagents belong to voice turns, the submitted
+  texts) is saved in the session's `$.state` on every change, so a hot reload of the plugin in the
+  middle of a voice turn keeps the guard. If that state cannot be read after a reload, the running
+  turn and the subagents first seen during it are treated as voice turns until the next turn
+  starts or ends (fail-safe).
 - It is a seat belt, not a sandbox. Do not rely on it for security.
 
 ## Troubleshooting
@@ -258,7 +283,9 @@ Limits:
 | The voice interrupts itself | Use a headset (echo). |
 | The voice answers by itself instead of delegating | Ask more concretely ("look at the files in..."); adjust `persona.instructions`. |
 | Answer not spoken | The status line says why (`answer not spoken: ...`); the page log shows `Result -> speech`. |
-| Anything else | `%LOCALAPPDATA%\claude-code-voice-mod\logs\voice-*.log` (SDP credentials and secret-looking strings are redacted and answers are not logged, but transcripts and requests are in it: review before sharing). |
+| `voice: blocked: ...` / "Voice is blocked" on the page | MCP isolation could not be confirmed (see Architecture). Check the reason in the log; remove or fix the MCP server named there, then `/voice off` and `/voice on`. |
+| The page says "this link is used up" | The page opens only once per link. Run `/voice page`. |
+| Anything else | `%LOCALAPPDATA%\claude-code-voice-mod\logs\voice-*.log` (metadata only by default; with debug logging, transcripts and requests are in it: review before sharing). |
 
 ## Development
 

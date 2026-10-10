@@ -1,5 +1,6 @@
 {
   "voice": "maple",
+  "debugLog": false,
   "persona": {
     "name": "Mika",
     "userName": "Alex",

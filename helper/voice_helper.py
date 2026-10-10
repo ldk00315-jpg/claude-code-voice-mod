@@ -10,7 +10,8 @@
     WebRTC media flows page <-> OpenAI directly; codex keeps a sideband control socket.
 
 stdout protocol (one JSON object per line, read by the Claude Code plugin):
-  {"type":"ready","port":N,"pid":P,"url":..,"threadId":..,"token":..}   token: per-run secret for HTTP
+  {"type":"ready","port":N,"pid":P,"url":..,"threadId":..,"token":..,"pageUrl":..}
+        token: per-run secret for HTTP; pageUrl: the page with its one-time key (both stdout only)
   {"type":"realtime","state":"connecting|started|connected|media-connected|media-failed|closed|error",...}
   {"type":"voice","event":"selected|active","voice":..,"source"|"purpose":..}  chosen / in-use voice
   {"type":"transcript","role":"user|assistant","text":..}       final text of one utterance
@@ -23,15 +24,20 @@ stdout protocol (one JSON object per line, read by the Claude Code plugin):
   {"type":"answer_delivered","id":..,"status":..,"chars":N,"via":"appendText|appendSpeech"}
   {"type":"answer_undelivered","id":..,"error":..}                realtime not running, etc.
   {"type":"ack","id":..}                                          POST /answer received
-  {"type":"mcp_warning","name":..,"status":..}                  an MCP server started despite being disabled
+  {"type":"mcp_blocked","reason":..}       MCP isolation failed or could not be confirmed: realtime
+                                            stopped and refused (before ready: the helper exits)
+  {"type":"page_url","pageUrl":..}         POST /reopen without --open (stdout only)
   {"type":"heartbeat"} / {"type":"bye","reason":..}
 
 HTTP (127.0.0.1 only). Every request must carry Host 127.0.0.1:<port> or localhost:<port>, and an
-Origin, when sent, must be exactly http://127.0.0.1:<port> or http://localhost:<port>. Every path but
-GET / (and /favicon.ico) needs the header X-Voice-Token: <token from the ready line>; the page gets
-the token embedded by GET /. No CORS headers are ever sent, so other web pages cannot read it.
-Anything refused gets 403.
-  GET  /              the voice page        GET /health  {"ok":true,...}
+Origin, when sent, must be exactly http://127.0.0.1:<port> or http://localhost:<port>. GET / needs
+?k=<one-time key> (the helper opens Edge with it; it works once, then the page strips it from the
+address bar); the page it serves carries the per-run token. Every other path but /favicon.ico needs
+the header X-Voice-Token: <token>. No CORS headers are ever sent. Anything refused gets 403. Bodies
+are JSON objects within a size limit (413), typed fields (400); reads time out after 10 s; at most 8
+requests are handled at once (503). Processes of the same OS user are out of scope: they can read
+the token from the plugin's process, the page, or Edge's memory.
+  GET  /?k=..         the voice page        GET /health  {"ok":true,...}
   GET  /events?since=N   recent events for the page
   GET  /voices    voice list (listVoices, static fallback) + selected/active voice
   GET  /settings  <data dir>/settings.json   POST /settings {"voice":..}  remember the voice
@@ -41,12 +47,16 @@ Anything refused gets 403.
   POST /client-state {"state":..}  page reports RTCPeerConnection state
   POST /answer  {"id":..,"answer":..,"status":"ok|aborted|error|refusal|timeout|busy"}
                 Claude's answer for a request -> trimmed -> thread/realtime/appendText, so the
-                realtime model speaks a 1-2 sentence summary
+                realtime model speaks a 1-2 sentence summary. Only ids of requests this helper
+                emitted in the current realtime session: unknown 403, earlier session 409
+  POST /reopen  a new one-time page link (opens Edge with --open, else a stdout page_url line)
   POST /shutdown  exit
 
 Data (logs, settings.json with the voice and the persona, an empty working folder for codex) is
 kept outside the plugin folder: --data-dir, else $VOICE_MOD_DATA_DIR, else
 %LOCALAPPDATA%\claude-code-voice-mod (~/.local/share/claude-code-voice-mod elsewhere).
+The log keeps metadata only (states, errors, ids, lengths) unless --debug-log or settings.json
+"debugLog": true; log files older than 7 days, and the oldest past 20 MB, are deleted at startup.
 
 Run:  uv run --script helper/voice_helper.py [--open]          (what the plugin does)
 Self test without microphone or browser (silent aiortc peer, sends one text):
@@ -219,6 +229,43 @@ def realtime_prompt():
 # Per-run secret (set in amain): required as X-Voice-Token on every HTTP call but GET /.
 TOKEN = ""
 
+# One-time page links. GET / needs ?k=<key> with a key minted for this run (the helper opens Edge
+# with it, /reopen mints a new one); a key works once, for PAGE_KEY_SECONDS, and is never logged.
+# The page it serves carries TOKEN for every later call.
+PAGE_KEY_SECONDS = 300
+PAGE_KEYS_MAX = 4
+_page_keys: dict[str, float] = {}  # key -> minted at (monotonic)
+_page_keys_lock = threading.Lock()
+
+
+def mint_page_key() -> str:
+    key = secrets.token_urlsafe(32)
+    with _page_keys_lock:
+        now = time.monotonic()
+        for k, at in list(_page_keys.items()):
+            if now - at > PAGE_KEY_SECONDS:
+                del _page_keys[k]
+        while len(_page_keys) >= PAGE_KEYS_MAX:
+            del _page_keys[min(_page_keys, key=_page_keys.get)]
+        _page_keys[key] = now
+    return key
+
+
+def use_page_key(given: str) -> bool:
+    """True once for a valid key (then it is gone); compared in constant time."""
+    got = given.encode("utf-8")
+    with _page_keys_lock:
+        now = time.monotonic()
+        for k, at in list(_page_keys.items()):
+            if hmac.compare_digest(got, k.encode("utf-8")):
+                del _page_keys[k]
+                return now - at <= PAGE_KEY_SECONDS
+    return False
+
+
+def page_url(port: int, key: str) -> str:
+    return f"http://127.0.0.1:{port}/?k={key}"
+
 
 def page_with_token(page: bytes, token: str) -> bytes:
     """The voice page with the per-run token in its <meta name="voice-token">."""
@@ -265,9 +312,6 @@ ANSWER_SPOKEN_CHECK_SECONDS = 12  # no assistant transcript by then -> one retry
 # Secret-looking strings, replaced by [REDACTED] in Claude's answers before they go to the realtime
 # model (OpenAI), and in everything written to the log. Best effort: it catches common formats,
 # not every secret, and may also hide harmless long ids (commit hashes, for example).
-# Names whose value is a secret in "name = value" / "name: value" (config files, env, JSON).
-_SECRET_NAMES = (r"password|passwd|pwd|secret|token|api[_\-]?key|access[_\-]?key|private[_\-]?key|"
-                 r"client[_\-]?secret|authorization|credentials?")
 _SECRET_RULES = [
     # PEM private keys: the whole block (or up to the end of the text when it is cut off)
     (re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\Z)", re.S),
@@ -288,16 +332,92 @@ _SECRET_RULES = [
     (re.compile(r"\b(?:AKIA|ASIA|AGPA|AIDA|AROA|ANPA)[0-9A-Z]{16}\b"), "[REDACTED]"),  # AWS key ids
     (re.compile(r"\bAIza[0-9A-Za-z_\-]{35}"), "[REDACTED]"),  # Google API keys
     (re.compile(r"\b(?:npm|hf)_[A-Za-z0-9]{30,}"), "[REDACTED]"),
-    # name = value / name: value assignments (password, secret, token, api_key, ...): a quoted value
-    # whole, else up to a space or separator; small numbers (max_tokens = 4096) are left alone
-    (re.compile(r"(?i)(\b[\w.\-]*(?:" + _SECRET_NAMES + r")[\w.\-]*\b[\"']?\s*[:=]\s*)([\"'])(?!\[REDACTED\])"
-                r"[^\"'\n]{3,}?\2"), r"\1\2[REDACTED]\2"),
-    (re.compile(r"(?i)(\b[\w.\-]*(?:" + _SECRET_NAMES + r")[\w.\-]*\b[\"']?\s*[:=]\s*[\"']?)"
-                r"(?!\[REDACTED\])(?!\d{1,6}\b)[^\s\"',;}]{3,}"), r"\1[REDACTED]"),
-    (re.compile(r"((?:パスワード|暗証番号)\s*[:：=]\s*)\S+"), r"\1[REDACTED]"),
     # long hex strings (32+), e.g. API secrets, hashes
     (re.compile(r"(?<![0-9A-Za-z])[0-9a-fA-F]{32,}(?![0-9A-Za-z])"), "[REDACTED]"),
 ]
+
+# Secret-named assignments: "name = value", "name: value", "name=value" (env), '"name": value'
+# (JSON), and prose ("the password is 123456"). For a secret name every value is hidden, short
+# numbers included. A name is secret when one of its parts (split at _ - . and camelCase) is a
+# short secret word, or when it contains a long one. Only the names in _HARMLESS_NAMES keep a
+# numeric value (token counts and the like).
+_SECRET_SUBSTRINGS = ("password", "passwd", "passphrase", "passcode", "secret", "token", "apikey",
+                      "accesskey", "privatekey", "credential", "authorization")
+_SECRET_PARTS = {"pwd", "pin", "pins", "otp"}
+_HARMLESS_NAMES = {  # compared lower case with _ - . removed; numeric values only
+    "maxtokens", "maxtoken", "maxoutputtokens", "maxcompletiontokens", "maxnewtokens", "maxinputtokens",
+    "numtokens", "tokens", "totaltokens", "prompttokens", "completiontokens", "inputtokens",
+    "outputtokens", "cachedtokens", "reasoningtokens", "tokencount", "tokenlimit", "tokenbudget",
+    "tokenusage", "tokensused", "timeout", "port",
+}
+# Prose values that are words about the secret, not the secret ("the password is wrong").
+_PROSE_WORDS = {
+    "a", "an", "the", "not", "now", "still", "also", "too", "being", "only", "same", "different",
+    "wrong", "correct", "incorrect", "invalid", "valid", "expired", "missing", "required", "needed",
+    "set", "unset", "empty", "blank", "stored", "saved", "hidden", "changed", "updated", "rotated",
+    "revoked", "encrypted", "hashed", "known", "unknown", "in", "on", "at", "for", "from", "used",
+    "ok", "fine", "weak", "strong", "long", "short", "there", "here", "it", "this", "that", "no",
+    "none", "null",
+}
+_ASSIGNMENT = re.compile(
+    r"(?<![A-Za-z0-9_])(?P<q>[\"']?)(?P<name>[A-Za-z_][A-Za-z0-9_.\-]*)(?P=q)"
+    r"(?P<sep>\s*(?:=>|[:=：＝])\s*|\s+(?:is|was|are)\s+)"
+    r"(?=(?P<val>\"[^\"\n]*\"|'[^'\n]*'|[^\s\"',;}\])]+))",  # a lookahead: "id:token=x" finds token too
+    re.I)
+_JA_SECRET = re.compile(
+    r"(?P<lead>(?:パスワード|暗証番号|パスコード|合言葉|ＰＩＮ|PIN)(?:コード)?\s*(?:は|が|[:：=＝])\s*)"
+    r"(?P<val>「[^」\n]*」|[^\s、。，,]+)")
+_CAMEL = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+
+
+def _name_parts(name: str) -> list[str]:
+    return [p.lower() for p in re.split(r"[_.\-]+", _CAMEL.sub("_", name)) if p]
+
+
+def is_secret_name(name: str) -> bool:
+    """Whether "name = value" holds a secret (password, pin, api_key, clientSecret, ...)."""
+    parts = _name_parts(name)
+    fused = "".join(parts)
+    return any(p in _SECRET_PARTS for p in parts) or any(w in fused for w in _SECRET_SUBSTRINGS)
+
+
+def _secret_value(m: re.Match) -> bool:
+    """Whether the value after this name/separator is to be hidden."""
+    name, val, sep = m.group("name"), m.group("val"), m.group("sep")
+    if not is_secret_name(name):
+        return False
+    bare = val.strip("\"'")
+    if bare.startswith("[REDACTED"):
+        return False
+    if "".join(_name_parts(name)) in _HARMLESS_NAMES and re.fullmatch(r"-?\d+(\.\d+)?", bare):
+        return False
+    if sep.strip().lower() in ("is", "was", "are") and bare.lower().rstrip(".!?") in _PROSE_WORDS:
+        return False
+    return True
+
+
+def _redact_assignments(text: str) -> str:
+    out, pos = [], 0
+    for m in _ASSIGNMENT.finditer(text):
+        start, end = m.start("val"), m.end("val")
+        if start < pos or not _secret_value(m):
+            continue  # inside a value already hidden, or not a secret
+        val = m.group("val")
+        quote = val[0] if val[:1] in ("\"", "'") and len(val) >= 2 and val[-1] == val[0] else ""
+        if not quote and len(val.rstrip(".!?:")) > 0:
+            end = start + len(val.rstrip(".!?:"))  # keep a sentence's full stop
+        out += [text[pos:start], f"{quote}[REDACTED]{quote}"]
+        pos = end
+    return "".join(out) + text[pos:]
+
+
+def _ja_secret(m: re.Match) -> str:
+    val = m.group("val")
+    if val.strip("「」").startswith("[REDACTED"):
+        return m.group(0)
+    return m.group("lead") + ("「[REDACTED]」" if val.startswith("「") else "[REDACTED]")
+
+
 _LONG_TOKEN = re.compile(r"(?<![A-Za-z0-9+/_\-])[A-Za-z0-9+/_\-]{32,}={0,2}(?![A-Za-z0-9+/=_\-])")
 
 
@@ -317,6 +437,8 @@ def redact_secrets(text: str) -> str:
         return text
     for pattern, repl in _SECRET_RULES:
         text = pattern.sub(repl, text)
+    text = _redact_assignments(text)
+    text = _JA_SECRET.sub(_ja_secret, text)
     return _LONG_TOKEN.sub(_long_token, text)
 
 
@@ -351,8 +473,41 @@ def _strip_sdp(obj):
     return obj
 
 
+# Conversation logging is off unless --debug-log or settings.json "debugLog": true. Off, the log
+# gets metadata only: states, errors, ids, names, numbers and the length of every other text.
+DEBUG_LOG = False
+_META_KEYS = {"type", "state", "event", "id", "role", "status", "via", "version", "voice", "purpose", "source",
+              "method", "threadId", "turnId", "itemType", "phase", "outcome", "name", "runtimeStatus", "error",
+              "message", "reason", "by", "url", "log", "realtimeSessionId", "responseId", "handoff_id",
+              "item_id", "code", "model", "modelProvider", "kind", "detail", "cursor", "nextCursor",
+              "approvalPolicy", "sandbox", "userAgent"}
+_META_LISTS = {"keys", "voices", "v1", "v2", "media", "codecs"}
+
+
+def metadata(obj, key: str = ""):
+    """`obj` with every text replaced by its length, except the values of _META_KEYS (states,
+    ids, errors, names). What the log keeps of a message when conversation logging is off."""
+    if isinstance(obj, dict):
+        return {k: metadata(v, k) for k, v in obj.items()}
+    if isinstance(obj, list):
+        if key in _META_LISTS and all(isinstance(v, str) for v in obj):
+            return obj[:50]
+        return [metadata(v, key) for v in obj]
+    if isinstance(obj, str):
+        if key in _META_KEYS:
+            return obj[:300]
+        return f"<{len(obj)} chars>"
+    return obj
+
+
 def loggable(raw: str, limit: int = 4000) -> str:
-    """Raw JSON for the log, with SDP bodies replaced by a size note (they hold ICE credentials)."""
+    """Raw JSON for the log. Debug logging: SDP bodies replaced by a size note (they hold ICE
+    credentials). Otherwise only its metadata (see metadata())."""
+    if not DEBUG_LOG:
+        try:
+            return json.dumps(metadata(json.loads(raw)), ensure_ascii=False)[:limit]
+        except ValueError:
+            return f"<{len(raw)} chars, not JSON>"
     if '"sdp"' in raw:
         try:
             raw = json.dumps(_strip_sdp(json.loads(raw)), ensure_ascii=False)
@@ -369,9 +524,63 @@ def sdp_summary(sdp: str) -> str:
     return f"{len(sdp)} bytes, media={media}, codecs={codecs}, candidates={cands}"
 
 
+LOG_MAX_AGE_DAYS = 7
+LOG_MAX_TOTAL_BYTES = 20 * 1024 * 1024
+ANSWERS_ROTATE_BYTES = 1024 * 1024
+
+
+def prune_logs(log_dir: str, max_age_days: float = LOG_MAX_AGE_DAYS,
+               max_total: int = LOG_MAX_TOTAL_BYTES, now: float | None = None) -> list[str]:
+    """Retention, applied at startup: rotates voice-answers.jsonl past 1 MB, deletes the helper's
+    log files older than max_age_days, then the oldest ones until all of them fit in max_total."""
+    removed = []
+    now = time.time() if now is None else now
+    answers = os.path.join(log_dir, "voice-answers.jsonl")
+    try:
+        if os.path.getsize(answers) > ANSWERS_ROTATE_BYTES:
+            os.replace(answers, os.path.join(log_dir, "voice-answers.1.jsonl"))
+    except OSError:
+        pass
+    files = []
+    try:
+        names = os.listdir(log_dir)
+    except OSError:
+        return removed
+    for name in names:
+        if not re.fullmatch(r"voice-.+\.(log|jsonl)", name):
+            continue  # only the helper's own files
+        path = os.path.join(log_dir, name)
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        files.append([st.st_mtime, st.st_size, path])
+    files.sort()
+    for f in list(files):
+        if now - f[0] > max_age_days * 86400:
+            try:
+                os.remove(f[2])
+                removed.append(f[2])
+                files.remove(f)
+            except OSError:
+                pass
+    total = sum(f[1] for f in files)
+    for f in list(files):
+        if total <= max_total:
+            break
+        try:
+            os.remove(f[2])
+            removed.append(f[2])
+            total -= f[1]
+        except OSError:
+            pass
+    return removed
+
+
 class Log:
     def __init__(self):
         os.makedirs(LOG_DIR, exist_ok=True)
+        self.pruned = prune_logs(LOG_DIR)
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         self.path = os.path.join(LOG_DIR, f"voice-{stamp}.log")
         self._f = open(self.path, "a", encoding="utf-8")
@@ -398,12 +607,16 @@ _seq = 0
 _stop_cb = None  # set by main: callable(reason)
 
 
+# Fields that go to stdout (the Mod) only: never to the log or the page's event buffer.
+_STDOUT_ONLY = ("token", "pageUrl")
+
+
 def emit(obj: dict):
     """One JSON line to stdout (+ log + page event buffer). A broken pipe means the parent is gone."""
     global _seq
     line = json.dumps(obj, ensure_ascii=False)
-    public = {k: v for k, v in obj.items() if k != "token"}  # the token goes to stdout (the Mod) only
-    LOG.write("OUT", json.dumps(public, ensure_ascii=False) if "token" in obj else line)
+    public = {k: v for k, v in obj.items() if k not in _STDOUT_ONLY}
+    LOG.write("OUT", json.dumps(public if DEBUG_LOG else metadata(public), ensure_ascii=False))
     with _out_lock:
         _seq += 1
         if obj.get("type") != "heartbeat":
@@ -421,6 +634,16 @@ def emit(obj: dict):
 
 
 # ---------------------------------------------------------------- settings.json (remembered voice)
+
+def _read_settings_quietly() -> dict:
+    """settings.json before the log exists (for "debugLog")."""
+    try:
+        with open(SETTINGS_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
 
 def load_settings() -> dict:
     try:
@@ -450,37 +673,53 @@ def save_settings(updates: dict) -> dict:
 _SAFE_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
-def user_mcp_server_names(path: str = CODEX_CONFIG_PATH) -> list[str]:
-    """Names under [mcp_servers] in ~/.codex/config.toml (read only, never written)."""
+def user_mcp_server_names(path: str | None = None) -> list[str]:
+    """Names under [mcp_servers] in $CODEX_HOME/config.toml (read only, never written)."""
+    path = path or CODEX_CONFIG_PATH
     try:
         import tomllib
         with open(path, "rb") as f:
             data = tomllib.load(f)
     except FileNotFoundError:
         return []
-    except Exception as e:  # unreadable config: codex itself will complain; we just skip
+    except Exception as e:  # unreadable config: codex itself complains; config/read decides later
         LOG.write("WARN", f"could not read {path}: {e!r}")
         return []
     servers = data.get("mcp_servers")
     return sorted(servers.keys()) if isinstance(servers, dict) else []
 
 
+def toml_key(name: str) -> str:
+    """A TOML key for `name`: bare when it may be, else a quoted (basic string) key."""
+    return name if _SAFE_KEY.match(name) else json.dumps(name, ensure_ascii=False)
+
+
 def mcp_disable_overrides(names: list[str]) -> list[str]:
-    """`-c mcp_servers.<name>.enabled=false` for each configured server (config/src/mcp_types.rs:
-    RawMcpServerConfig.enabled). Only servers defined in config.toml: an override for an unknown
-    name would create a server entry without a transport, which codex rejects."""
-    out = []
-    for name in names:
-        if _SAFE_KEY.match(name):
-            out.append(f"mcp_servers.{name}.enabled=false")
-        else:
-            LOG.write("WARN", f"MCP server name {name!r} not overridable from the CLI; left as is")
-    return out
+    """One `-c mcp_servers={<name>={enabled=false}, ...}` that disables every configured server
+    (config/src/mcp_types.rs: RawMcpServerConfig.enabled).
+
+    codex rust-v0.160.0 splits a -c key path at every dot and knows no quoted keys there
+    (config/src/overrides.rs apply_toml_override), so `mcp_servers."corp.files".enabled` would
+    address the wrong table. The value, however, is parsed as TOML (utils/cli/src/
+    config_override.rs), where a quoted key may hold dots. Only one override: a second
+    `mcp_servers=` replaces the first inside the CLI layer, which is then merged over config.toml
+    (config/src/merge.rs), so each server keeps its transport. Only servers defined in
+    config.toml: an entry for an unknown name would have no transport, which codex rejects."""
+    if not names:
+        return []
+    body = ", ".join(f"{toml_key(n)}={{enabled=false}}" for n in names)
+    return ["mcp_servers={" + body + "}"]
+
+
+def all_mcp_server_names(config: dict) -> list[str]:
+    """Every server in the effective config that `config/read` returned (system, user, profile,
+    project layers and the -c overrides), whatever its state."""
+    servers = config.get("mcp_servers") if isinstance(config, dict) else None
+    return sorted(servers.keys()) if isinstance(servers, dict) else []
 
 
 def enabled_mcp_server_names(config: dict) -> list[str]:
-    """Servers that `config/read` (the effective config, every layer: system, user, profile, project)
-    reports as not disabled."""
+    """The servers of the effective config that are not disabled."""
     servers = config.get("mcp_servers") if isinstance(config, dict) else None
     if not isinstance(servers, dict):
         return []
@@ -489,15 +728,28 @@ def enabled_mcp_server_names(config: dict) -> list[str]:
 
 
 def thread_mcp_overrides(names: list[str]) -> dict:
-    """thread/start `config` overrides that disable each named server for the helper's thread
-    (dotted keys, like -c). A name with a dot cannot be addressed this way and is reported."""
-    out = {}
-    for name in names:
-        if "." in name or not name:
-            LOG.write("WARN", f"MCP server name {name!r} cannot be disabled by a thread override")
-        else:
-            out[f"mcp_servers.{name}.enabled"] = False
-    return out
+    """thread/start `config` that disables every named server for the helper's thread, as one
+    nested object: {"mcp_servers": {"corp.files": {"enabled": false}, ...}}.
+
+    The app-server applies these keys like -c overrides (rust-v0.160.0 app-server/src/
+    config_manager.rs load_with_cli_overrides: chained after the process's -c overrides into one
+    CLI layer). A nested object reaches names with dots, which a dotted key cannot; and because
+    it replaces the CLI layer's own `mcp_servers` table, it must name every server, the ones
+    the -c override already disabled included."""
+    if not names:
+        return {}
+    return {"mcp_servers": {n: {"enabled": False} for n in names}}
+
+
+class McpIsolationError(RuntimeError):
+    """No realtime session may run: an MCP server could run for the helper's codex thread, or
+    that could not be confirmed."""
+
+
+# MCP server states (app-server-protocol v2 McpServerConnectionStatus) that are safe: disabled.
+# Anything else (notStarted can still start, starting, connected, authenticationRequired, failed,
+# cancelled, or no status at all) means the server was not disabled.
+MCP_SAFE_STATES = {"disabled"}
 
 
 # ---------------------------------------------------------------- answers -> realtime text
@@ -643,9 +895,12 @@ class AppServer:
         self.voices_raw = None  # result of thread/realtime/listVoices (None = not available)
         self.active_voice = None  # voice of the running realtime session
         self.purpose = None  # "conversation" | "preview" while realtime runs
-        self._session_gen = 0
+        self._session_gen = 0  # bumped by every realtime start and stop
+        self._rt_lock = asyncio.Lock()  # start_realtime / stop_realtime run one at a time
+        self.mcp_blocked: str | None = None  # why no realtime session may run (MCP isolation)
+        self.cli_mcp_names: list[str] = []  # servers the -c override disabled at spawn
         # handoffs from the realtime model -> requests for Claude Code
-        self.requests: dict[str, dict] = {}  # handoff id -> {"text", "at", "answered"}
+        self.requests: dict[str, dict] = {}  # handoff id -> {"text", "at", "answered", "gen", "emitted"}
         self.recent_user: deque = deque(maxlen=4)  # last final user utterances (context for requests)
         self.assistant_seq = 0  # bumps on each final assistant transcript
         self.emit_requests = True
@@ -653,8 +908,9 @@ class AppServer:
 
     async def start(self):
         args = [self.exe, "app-server"]
-        mcp = mcp_disable_overrides(user_mcp_server_names())
-        LOG.write("INFO", f"user MCP servers disabled for this app-server: {mcp}")
+        self.cli_mcp_names = user_mcp_server_names()
+        mcp = mcp_disable_overrides(self.cli_mcp_names)
+        LOG.write("INFO", f"MCP servers in config.toml, disabled by -c for this app-server: {self.cli_mcp_names}")
         for o in CODEX_OVERRIDES + mcp:
             args += ["-c", o]
         for f in CODEX_DISABLED_FEATURES:
@@ -718,7 +974,7 @@ class AppServer:
                 try:
                     msg = json.loads(text)
                 except ValueError:
-                    LOG.write("RPC<?", text[:2000])
+                    LOG.write("RPC<?", text[:2000] if DEBUG_LOG else f"<{len(text)} chars, not JSON>")
                     continue
                 try:
                     await self._dispatch(msg, text)
@@ -744,7 +1000,7 @@ class AppServer:
                     fut.set_result(msg.get("result"))
             return
         if "id" in msg:  # server -> client request
-            LOG.write("SREQ<", raw[:4000])
+            LOG.write("SREQ<", loggable(raw))
             await self._answer_server_request(msg)
             return
         await self._on_notification(method, msg.get("params") or {}, raw)
@@ -847,12 +1103,26 @@ class AppServer:
                 emit({"type": "codex_item", "itemType": item.get("type"), "turnId": p.get("turnId")})
 
     def _on_mcp_status(self, name: str, status: str):
-        """Every MCP server is disabled for this app-server; one that still starts is reported."""
+        """Every MCP server is disabled for this app-server: one that reports a startup status
+        anyway (starting, ready, failed, cancelled) was not. No realtime session may run then."""
         if (name, status) in self.mcp_warned:
             return
         self.mcp_warned.add((name, status))
-        LOG.write("WARN", f"MCP server {name!r} {status} although MCP servers are disabled for the voice helper")
-        emit({"type": "mcp_warning", "name": name, "status": status})
+        self.block_realtime(f"MCP server {name!r} reported {status!r} although every MCP server is "
+                            "disabled for the voice helper")
+
+    def block_realtime(self, reason: str):
+        """MCP isolation failed: stop the realtime session (if any) and refuse new ones."""
+        first = self.mcp_blocked is None
+        if first:
+            self.mcp_blocked = reason
+        LOG.write("ERROR", f"realtime blocked: {reason}")
+        emit({"type": "mcp_blocked", "reason": reason})
+        if self._sdp_wait and not self._sdp_wait.done():
+            self._sdp_wait.set_exception(McpIsolationError(reason))
+        if first and self.thread_id:
+            # not awaited: this runs inside the stdout reader, which a stop waits on
+            asyncio.get_running_loop().create_task(self.stop_realtime())
 
     def _on_handoff(self, item: dict):
         """One handoff_request (bespoke_event_handling.rs) -> one stdout "request" line.
@@ -866,12 +1136,13 @@ class AppServer:
             text = "\n".join(f"{e.get('role')}: {e.get('text')}" for e in entries
                              if isinstance(e, dict) and e.get("text")).strip()
         if not hid or not text:
-            LOG.write("WARN", f"handoff without id or text: {json.dumps(item, ensure_ascii=False)[:500]}")
+            LOG.write("WARN", f"handoff without id or text: {loggable(json.dumps(item, ensure_ascii=False), 500)}")
             return
         if hid in self.requests:
             LOG.write("INFO", f"duplicate handoff {hid} ignored")
             return
-        self.requests[hid] = {"text": text, "at": time.time(), "answered": False}
+        self.requests[hid] = {"text": text, "at": time.time(), "answered": False, "gen": self._session_gen,
+                              "emitted": self.emit_requests}
         if self.emit_requests:
             emit({"type": "request", "id": hid, "text": text, "userSaid": list(self.recent_user)})
 
@@ -885,8 +1156,10 @@ class AppServer:
         `session.context.append` on the sideband socket (methods_common.rs; appendSpeech adds
         channel "speakable"). appendText is used first (the selftest showed it makes the model
         speak); if no assistant transcript follows, one retry goes through appendSpeech."""
-        req = self.requests.get(rid) or {"text": "", "at": time.time(), "answered": False}
-        self.requests[rid] = req
+        why = self.answer_refusal(rid)
+        if why:
+            return {"ok": False, "error": why, "refused": True}
+        req = self.requests[rid]
         if not self.realtime_active:
             emit({"type": "answer_undelivered", "id": rid, "error": "realtime not running"})
             return {"ok": False, "error": "realtime not running"}
@@ -901,6 +1174,16 @@ class AppServer:
               "via": "appendText", "again": late})
         asyncio.create_task(self._ensure_spoken(rid, msg, seq))
         return {"ok": True, "chars": len(msg)}
+
+    def answer_refusal(self, rid: str) -> str | None:
+        """Why an answer for `rid` is not taken (None: it is). Only a request this helper emitted
+        in the current realtime session is answered; nothing is recorded for a refused id."""
+        req = self.requests.get(rid)
+        if not req or not req.get("emitted"):
+            return "unknown request id"
+        if req.get("gen") != self._session_gen:
+            return "request belongs to an earlier realtime session"
+        return None
 
     async def _ensure_spoken(self, rid: str, msg: str, seq: int):
         for _ in range(ANSWER_SPOKEN_CHECK_SECONDS * 2):
@@ -927,7 +1210,7 @@ class AppServer:
     # -- high level
     async def handshake(self):
         init = await self.request("initialize", {
-            "clientInfo": {"name": "claude_voice_mod", "title": "Claude Voice Mod", "version": "0.2.0"},
+            "clientInfo": {"name": "claude_voice_mod", "title": "Claude Voice Mod", "version": "0.3.0"},
             "capabilities": {"experimentalApi": True, "requestAttestation": False},
         }, timeout=60)
         await self.notify("initialized")
@@ -945,42 +1228,65 @@ class AppServer:
             params["config"] = overrides
         res = await self.request("thread/start", params, timeout=90)
         self.thread_id = res["thread"]["id"]
-        asyncio.create_task(self.check_mcp_servers())
         LOG.write("INFO", f"thread {self.thread_id} model={res.get('model')} provider={res.get('modelProvider')} "
                           f"approval={res.get('approvalPolicy')} sandbox={json.dumps(res.get('sandbox'))}")
+        await self.check_mcp_servers()
         await self.list_voices()
         return res
 
     async def mcp_thread_overrides(self) -> dict:
-        """No MCP server may run for the helper. The -c overrides at spawn cover the servers in
-        config.toml, and --disable apps/plugins the app and plugin ones; codex merges -c tables
-        (rust-v0.160.0 config/src/merge.rs), so `mcp_servers={}` cannot empty the table. Any server
-        the effective config (config/read: system, user, profile and project layers) still has
-        enabled is disabled for the thread through thread/start `config`."""
+        """No MCP server may run for the helper. The -c override at spawn covers the servers in
+        config.toml, and --disable apps/plugins the app and plugin ones. The effective config
+        (config/read: system, user, profile and project layers) must then be readable, and every
+        server it names is disabled again for the thread through thread/start `config`. If it
+        cannot be read, the helper refuses to start (McpIsolationError)."""
         try:
             res = await self.request("config/read", {"cwd": CODEX_CWD}, timeout=30)
         except Exception as e:
-            LOG.write("WARN", f"config/read failed ({e}); relying on the -c overrides only")
-            return {}
-        names = enabled_mcp_server_names((res or {}).get("config") or {})
-        LOG.write("INFO", f"MCP servers still enabled after the -c overrides: {names}")
+            raise McpIsolationError(f"config/read failed ({e}); cannot confirm that MCP servers are off")
+        config = res.get("config") if isinstance(res, dict) else None
+        if not isinstance(config, dict):
+            raise McpIsolationError("config/read returned no config; cannot confirm that MCP servers are off")
+        names = sorted(set(all_mcp_server_names(config)) | set(self.cli_mcp_names))
+        LOG.write("INFO", f"MCP servers in the effective config: {names}; "
+                          f"not yet disabled: {enabled_mcp_server_names(config)}")
         return thread_mcp_overrides(names)
 
+    async def mcp_server_states(self) -> dict:
+        """name -> runtimeStatus of every MCP server of the helper's thread (all pages)."""
+        states, cursor = {}, None
+        for _ in range(50):
+            params = {"threadId": self.thread_id, "detail": "toolsAndAuthOnly", "limit": 100}
+            if cursor:
+                params["cursor"] = cursor
+            res = await self.request("mcpServerStatus/list", params, timeout=30)
+            if not isinstance(res, dict) or not isinstance(res.get("data"), list):
+                raise McpIsolationError("mcpServerStatus/list returned no list")
+            for r in res["data"]:
+                if isinstance(r, dict):
+                    states[str(r.get("name"))] = r.get("runtimeStatus")
+            cursor = res.get("nextCursor")
+            if not cursor:
+                return states
+        raise McpIsolationError("mcpServerStatus/list did not end")
+
     async def check_mcp_servers(self):
-        """After thread/start: reports any MCP server of the thread that is not disabled."""
-        await asyncio.sleep(3)
+        """Required before the helper reports ready: the status list must be readable and every
+        MCP server in it disabled. Otherwise McpIsolationError (the helper refuses to start)."""
+        if self.mcp_blocked:
+            raise McpIsolationError(self.mcp_blocked)
         try:
-            res = await self.request("mcpServerStatus/list", {"threadId": self.thread_id,
-                                                              "detail": "toolsAndAuthOnly"}, timeout=30)
+            states = await self.mcp_server_states()
+        except McpIsolationError:
+            raise
         except Exception as e:
-            LOG.write("WARN", f"mcpServerStatus/list failed: {e}")
-            return
-        rows = (res or {}).get("data") or []
-        states = {str(r.get("name")): r.get("runtimeStatus") for r in rows if isinstance(r, dict)}
+            raise McpIsolationError(f"mcpServerStatus/list failed ({e}); cannot confirm that MCP servers are off")
         LOG.write("INFO", f"MCP servers for the voice thread: {states}")
-        for name, status in states.items():
-            if status not in ("disabled", None):
-                self._on_mcp_status(name, str(status))
+        running = {n: st for n, st in states.items() if st not in MCP_SAFE_STATES}
+        if running:
+            raise McpIsolationError(f"MCP servers not disabled for the voice thread: {running}")
+        if self.mcp_blocked:  # a startup notification arrived meanwhile
+            raise McpIsolationError(self.mcp_blocked)
 
     async def list_voices(self) -> bool:
         try:
@@ -1007,50 +1313,67 @@ class AppServer:
                              purpose: str = "conversation") -> str:
         # The voice is part of the session config sent at start; codex 0.160.0 has no RPC to
         # change it mid-session, so a different voice always means a new realtime session.
-        if self.realtime_active:
-            await self.stop_realtime()
-        LOG.write("SDP>", "offer " + sdp_summary(offer_sdp))
-        loop = asyncio.get_running_loop()
-        self._sdp_wait = loop.create_future()
-        params = {
-            "threadId": self.thread_id,
-            "outputModality": "audio",
-            "transport": {"type": "webrtc", "sdp": offer_sdp},
-            "prompt": realtime_prompt(),
-            "includeStartupContext": False,
-            "clientManagedHandoffs": True,
-            # what the backing Codex model is told when realtime starts (default: realtime_start.md)
-            "realtimeStartInstructions": CODEX_DEVELOPER_INSTRUCTIONS,
-        }
-        if version:
-            params["version"] = version
-        if voice:
-            params["voice"] = voice
-        emit({"type": "realtime", "state": "connecting", "version": version or "default", "voice": voice,
-              "purpose": purpose})
-        self._session_gen += 1
-        gen = self._session_gen
-        await self.request("thread/realtime/start", params, timeout=30)
-        answer = await asyncio.wait_for(self._sdp_wait, SDP_TIMEOUT)
-        self.realtime_active = True
-        self.active_voice = voice or self.voice_options(version)[1]
-        self.purpose = purpose
-        emit({"type": "realtime", "state": "connected", "by": "codex (SDP answer returned)"})
-        emit({"type": "voice", "event": "active", "voice": self.active_voice, "purpose": purpose})
-        if purpose == "preview":
-            asyncio.create_task(self._preview_guard(gen))
-        return answer
+        # One start or stop at a time (several HTTP threads may ask at once).
+        async with self._rt_lock:
+            if self.mcp_blocked:
+                raise McpIsolationError(self.mcp_blocked)
+            if self.realtime_active:
+                await self._stop_realtime_locked()
+            LOG.write("SDP>", "offer " + sdp_summary(offer_sdp))
+            loop = asyncio.get_running_loop()
+            self._sdp_wait = loop.create_future()
+            params = {
+                "threadId": self.thread_id,
+                "outputModality": "audio",
+                "transport": {"type": "webrtc", "sdp": offer_sdp},
+                "prompt": realtime_prompt(),
+                "includeStartupContext": False,
+                "clientManagedHandoffs": True,
+                # what the backing Codex model is told when realtime starts (default: realtime_start.md)
+                "realtimeStartInstructions": CODEX_DEVELOPER_INSTRUCTIONS,
+            }
+            if version:
+                params["version"] = version
+            if voice:
+                params["voice"] = voice
+            emit({"type": "realtime", "state": "connecting", "version": version or "default", "voice": voice,
+                  "purpose": purpose})
+            self._session_gen += 1
+            gen = self._session_gen
+            try:
+                await self.request("thread/realtime/start", params, timeout=30)
+                answer = await asyncio.wait_for(self._sdp_wait, SDP_TIMEOUT)
+            except BaseException:
+                await self._stop_realtime_locked()
+                raise
+            if self.mcp_blocked:
+                await self._stop_realtime_locked()
+                raise McpIsolationError(self.mcp_blocked)
+            self.realtime_active = True
+            self.active_voice = voice or self.voice_options(version)[1]
+            self.purpose = purpose
+            emit({"type": "realtime", "state": "connected", "by": "codex (SDP answer returned)"})
+            emit({"type": "voice", "event": "active", "voice": self.active_voice, "purpose": purpose})
+            if purpose == "preview":
+                asyncio.create_task(self._preview_guard(gen))
+            return answer
 
     async def _preview_guard(self, gen: int):
         """Stops a preview session if the page did not (page closed, reply never came, ...)."""
         await asyncio.sleep(PREVIEW_MAX_SECONDS)
-        if self._session_gen == gen and self.realtime_active and self.purpose == "preview":
-            LOG.write("INFO", f"preview still running after {PREVIEW_MAX_SECONDS}s; stopping it")
-            await self.stop_realtime()
+        async with self._rt_lock:
+            if self._session_gen == gen and self.realtime_active and self.purpose == "preview":
+                LOG.write("INFO", f"preview still running after {PREVIEW_MAX_SECONDS}s; stopping it")
+                await self._stop_realtime_locked()
 
     async def stop_realtime(self):
+        async with self._rt_lock:
+            await self._stop_realtime_locked()
+
+    async def _stop_realtime_locked(self):
         if not self.thread_id:
             return
+        self._session_gen += 1  # answers for requests of the stopped session are refused
         try:
             await self.request("thread/realtime/stop", {"threadId": self.thread_id}, timeout=10)
         except Exception as e:
@@ -1131,8 +1454,76 @@ class Bridge:
                 "previewText": preview_text(), "settingsPath": SETTINGS_PATH}
 
 
+# HTTP limits: request bodies (bytes) per path, the socket read timeout, concurrent handlers.
+BODY_LIMITS = {"/offer": 256 * 1024, "/answer": 128 * 1024}
+BODY_LIMIT_DEFAULT = 16 * 1024
+BODY_LIMIT_MAX = 1024 * 1024
+HTTP_READ_TIMEOUT = 10
+HTTP_MAX_HANDLERS = 8
+ANSWER_STATUSES = re.compile(r"^[a-z_]{1,32}$")
+
+
+class HttpError(Exception):
+    def __init__(self, code: int, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+class LimitedHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer with at most HTTP_MAX_HANDLERS requests handled at once; one more
+    gets 503 at once (nothing read)."""
+    daemon_threads = True
+
+    def __init__(self, address, handler, max_handlers: int = HTTP_MAX_HANDLERS):
+        super().__init__(address, handler)
+        self._slots = threading.BoundedSemaphore(max_handlers)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            try:
+                request.sendall(b"HTTP/1.0 503 Service Unavailable\r\nContent-Length: 0\r\n"
+                                b"Retry-After: 1\r\nConnection: close\r\n\r\n")
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+    def handle_error(self, request, client_address):
+        LOG.write("HTTP", f"connection error: {sys.exc_info()[1]!r}")  # a client gone, a timeout
+
+
+def _field(data: dict, key: str, kind=str, required: bool = False, max_len: int = 0, default=None):
+    """One typed field of a JSON body, or HttpError(400)."""
+    value = data.get(key)
+    if value is None:
+        if required:
+            raise HttpError(400, f"{key} is required")
+        return default
+    if not isinstance(value, kind) or (kind is int and isinstance(value, bool)):
+        raise HttpError(400, f"{key} must be {kind.__name__}")
+    if max_len and isinstance(value, str) and len(value) > max_len:
+        raise HttpError(400, f"{key} is too long")
+    return value
+
+
+_PAGE_KEY_IN_PATH = re.compile(r"([?&]k=)[^&\s\"]*")
+
+
 def make_handler(bridge: Bridge):
     class Handler(BaseHTTPRequestHandler):
+        timeout = HTTP_READ_TIMEOUT  # socket timeout for the request line, headers and body
+
         def _reply(self, code, obj=None, body=None, ctype="application/json; charset=utf-8"):
             if body is None:
                 body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -1147,15 +1538,55 @@ def make_handler(bridge: Bridge):
             self.end_headers()
             self.wfile.write(body)
 
-        def _json(self):
-            length = int(self.headers.get("Content-Length") or 0)
+        def _json(self, path: str) -> dict:
+            """The request body as a JSON object, within the size limit for `path`."""
+            raw_length = self.headers.get("Content-Length")
+            if raw_length is None:
+                if self.headers.get("Transfer-Encoding"):
+                    raise HttpError(411, "Content-Length is required")
+                return {}
+            if not raw_length.strip().isdigit():
+                raise HttpError(400, "bad Content-Length")
+            length = int(raw_length)
+            limit = min(BODY_LIMITS.get(path, BODY_LIMIT_DEFAULT), BODY_LIMIT_MAX)
+            if length > limit:
+                raise HttpError(413, f"body over {limit} bytes")
+            self._body_read = True
             raw = self.rfile.read(length) if length else b""
-            return json.loads(raw.decode("utf-8") or "{}")
+            if len(raw) != length:
+                raise HttpError(400, "body shorter than Content-Length")
+            try:
+                data = json.loads(raw.decode("utf-8") or "{}")
+            except (UnicodeDecodeError, ValueError):
+                raise HttpError(400, "body is not JSON")
+            if not isinstance(data, dict):
+                raise HttpError(400, "body must be a JSON object")
+            return data
+
+        def _discard_body(self):
+            """Reads and drops a body that was not read (up to BODY_LIMIT_MAX), so the client
+            gets the error reply rather than a connection reset; the connection is closed."""
+            self.close_connection = True
+            if getattr(self, "_body_read", False):
+                return
+            self._body_read = True
+            raw_length = (self.headers.get("Content-Length") or "").strip()
+            left = int(raw_length) if raw_length.isdigit() else 0
+            if left > BODY_LIMIT_MAX:
+                return
+            try:
+                while left > 0:
+                    chunk = self.rfile.read(min(left, 65536))
+                    if not chunk:
+                        break
+                    left -= len(chunk)
+            except OSError:
+                pass
 
         def _refusal(self, open_path: bool) -> str | None:
             """Why this request is refused (403), or None. Host must be this server (no DNS
             rebinding), an Origin must be this server's own, and every path but the page itself
-            needs the per-run token."""
+            needs the per-run token (the page needs a one-time key instead)."""
             port = self.server.server_address[1]
             own = (f"127.0.0.1:{port}", f"localhost:{port}")
             if (self.headers.get("Host") or "").lower() not in own:
@@ -1173,9 +1604,16 @@ def make_handler(bridge: Bridge):
         def do_GET(self):
             url = urlparse(self.path)
             why = self._refusal(open_path=url.path in ("/", "/favicon.ico"))
+            if not why and url.path == "/":
+                key = (parse_qs(url.query).get("k") or [""])[0]
+                if not key or not use_page_key(key):
+                    why = "page link missing, used or expired"
             if why:
                 LOG.write("HTTP", f"403 GET {url.path}: {why}")
-                self._reply(403, {"ok": False, "error": why})
+                if url.path == "/":
+                    self._reply(403, body=PAGE_REFUSED, ctype="text/html; charset=utf-8")
+                else:
+                    self._reply(403, {"ok": False, "error": why})
                 return
             bridge.last_activity = time.monotonic()
             if url.path == "/":
@@ -1187,7 +1625,8 @@ def make_handler(bridge: Bridge):
             elif url.path == "/health":
                 self._reply(200, {"ok": True, "threadId": bridge.app.thread_id, "label": LABEL,
                                   "realtime": bridge.app.realtime_active, "voice": bridge.voice,
-                                  "activeVoice": bridge.app.active_voice, "purpose": bridge.app.purpose})
+                                  "activeVoice": bridge.app.active_voice, "purpose": bridge.app.purpose,
+                                  "blocked": bridge.app.mcp_blocked, "debugLog": DEBUG_LOG})
             elif url.path == "/voices":
                 if bridge.app.voices_raw is None:  # handshake call failed: try once more, else static list
                     try:
@@ -1198,7 +1637,11 @@ def make_handler(bridge: Bridge):
             elif url.path == "/settings":
                 self._reply(200, {"ok": True, "path": SETTINGS_PATH, "settings": load_settings()})
             elif url.path == "/events":
-                since = int((parse_qs(url.query).get("since") or ["0"])[0])
+                try:
+                    since = int((parse_qs(url.query).get("since") or ["0"])[0])
+                except ValueError:
+                    self._reply(400, {"ok": False, "error": "since must be a number"})
+                    return
                 with _out_lock:
                     evs = [{"seq": s, **o} for s, o in _events if s > since]
                     last = _seq
@@ -1211,91 +1654,137 @@ def make_handler(bridge: Bridge):
             why = self._refusal(open_path=False)
             if why:
                 LOG.write("HTTP", f"403 POST {path}: {why}")
+                self._discard_body()
                 self._reply(403, {"ok": False, "error": why})
                 return
             bridge.last_activity = time.monotonic()
             try:
-                data = self._json()
-            except ValueError:
-                self._reply(400, {"ok": False, "error": "body is not JSON"})
-                return
-            try:
-                if path == "/offer":
-                    purpose = "preview" if data.get("purpose") == "preview" else "conversation"
-                    voice = data.get("voice") or bridge.voice
-                    answer = bridge.run(bridge.app.start_realtime(
-                        data["sdp"], data.get("version") or bridge.args.version, voice, purpose),
-                        SDP_TIMEOUT + 40)
-                    self._reply(200, {"ok": True, "sdp": answer, "voice": bridge.app.active_voice,
-                                      "purpose": purpose})
-                elif path == "/settings":
-                    voice = data.get("voice")
-                    voices = bridge.app.voice_options(bridge.args.version)[0]
-                    if not isinstance(voice, str) or voice not in voices:
-                        self._reply(400, {"ok": False, "error": f"unknown voice: {voice!r}", "voices": voices})
-                        return
-                    saved = save_settings({"voice": voice})
-                    bridge.voice, bridge.voice_source = voice, "settings"
-                    LOG.write("INFO", f"settings saved: {json.dumps(saved, ensure_ascii=False)}")
-                    emit({"type": "voice", "event": "selected", "voice": voice, "source": "settings"})
-                    self._reply(200, {"ok": True, "settings": saved, **bridge.voices_info()})
-                elif path == "/label":
-                    global LABEL
-                    label = data.get("label")
-                    if not isinstance(label, str) or not label.strip():
-                        self._reply(400, {"ok": False, "error": "label is empty"})
-                        return
-                    LABEL = label.strip()[:60]
-                    LOG.write("INFO", f"label set: {LABEL}")
-                    emit({"type": "label", "label": LABEL})
-                    # The realtime prompt is fixed for a running session: the new name reaches
-                    # the voice model at the next Start.
-                    self._reply(200, {"ok": True, "label": LABEL, "appliesToVoice": "next start"
-                                      if bridge.app.realtime_active else "now"})
-                elif path == "/stop":
-                    bridge.run(bridge.app.stop_realtime(), 15)
-                    self._reply(200, {"ok": True})
-                elif path == "/say":
-                    bridge.run(bridge.app.say(str(data.get("text", "")), data.get("mode", "text")), 20)
-                    self._reply(200, {"ok": True})
-                elif path == "/client-state":
-                    state = str(data.get("state", ""))
-                    if state in ("connected", "failed", "disconnected", "closed"):
-                        mapped = {"connected": "media-connected", "failed": "media-failed"}.get(state, "media-" + state)
-                        emit({"type": "realtime", "state": mapped, "by": "page"})
-                    else:
-                        LOG.write("PAGE", json.dumps(data, ensure_ascii=False)[:2000])
-                    self._reply(200, {"ok": True})
-                elif path == "/answer":
-                    rid = str(data.get("id") or "")
-                    if not rid:
-                        self._reply(400, {"ok": False, "error": "id is required"})
-                        return
-                    answer = data.get("answer") if isinstance(data.get("answer"), str) else ""
-                    status = str(data.get("status") or "ok")
-                    os.makedirs(LOG_DIR, exist_ok=True)
-                    with open(ANSWERS_PATH, "a", encoding="utf-8") as f:
-                        f.write(json.dumps({"receivedAt": datetime.now().isoformat(), "id": rid, "status": status,
-                                            "chars": len(answer), "sha256": short_hash(answer),
-                                            "turnId": data.get("turnId")},
-                                           ensure_ascii=False) + "\n")
-                    emit({"type": "ack", "id": rid, "status": status})
-                    res = bridge.run(bridge.app.deliver_answer(rid, answer, status), 30)
-                    self._reply(200 if res.get("ok") else 409, res)
-                elif path == "/shutdown":
-                    self._reply(200, {"ok": True})
-                    bridge.loop.call_soon_threadsafe(_stop_cb, "shutdown requested")
-                else:
-                    self._reply(404, {"ok": False, "error": "not found"})
+                data = self._json(path)
+                self._post(path, data)
+            except HttpError as e:
+                LOG.write("HTTP", f"{e.code} POST {path}: {e}")
+                self._discard_body()
+                self._reply(e.code, {"ok": False, "error": str(e)})
+            except McpIsolationError as e:
+                self._reply(409, {"ok": False, "error": f"blocked: {e}", "blocked": True})
             except Exception as e:
                 LOG.write("ERROR", f"{path}: {e!r}")
                 self._reply(500, {"ok": False, "error": str(e) or type(e).__name__})
 
+        def _post(self, path: str, data: dict):
+            if path == "/offer":
+                sdp = _field(data, "sdp", str, required=True, max_len=BODY_LIMITS["/offer"])
+                purpose = "preview" if _field(data, "purpose", str, max_len=20) == "preview" else "conversation"
+                voice = _field(data, "voice", str, max_len=64) or bridge.voice
+                version = _field(data, "version", str, max_len=8) or bridge.args.version
+                answer = bridge.run(bridge.app.start_realtime(sdp, version, voice, purpose), SDP_TIMEOUT + 40)
+                self._reply(200, {"ok": True, "sdp": answer, "voice": bridge.app.active_voice,
+                                  "purpose": purpose})
+            elif path == "/settings":
+                voice = _field(data, "voice", str, required=True, max_len=64)
+                voices = bridge.app.voice_options(bridge.args.version)[0]
+                if voice not in voices:
+                    self._reply(400, {"ok": False, "error": f"unknown voice: {voice!r}", "voices": voices})
+                    return
+                saved = save_settings({"voice": voice})
+                bridge.voice, bridge.voice_source = voice, "settings"
+                LOG.write("INFO", f"settings saved: voice={voice!r} keys={sorted(saved)}")
+                emit({"type": "voice", "event": "selected", "voice": voice, "source": "settings"})
+                self._reply(200, {"ok": True, "settings": saved, **bridge.voices_info()})
+            elif path == "/label":
+                global LABEL
+                label = _field(data, "label", str, required=True, max_len=200).strip()
+                if not label:
+                    self._reply(400, {"ok": False, "error": "label is empty"})
+                    return
+                LABEL = label[:60]
+                LOG.write("INFO", f"label set ({len(LABEL)} chars)")
+                emit({"type": "label", "label": LABEL})
+                # The realtime prompt is fixed for a running session: the new name reaches
+                # the voice model at the next Start.
+                self._reply(200, {"ok": True, "label": LABEL, "appliesToVoice": "next start"
+                                  if bridge.app.realtime_active else "now"})
+            elif path == "/stop":
+                bridge.run(bridge.app.stop_realtime(), 15)
+                self._reply(200, {"ok": True})
+            elif path == "/say":
+                text = _field(data, "text", str, required=True, max_len=4000)
+                mode = _field(data, "mode", str, max_len=10, default="text")
+                if mode not in ("text", "speech"):
+                    raise HttpError(400, "mode must be text or speech")
+                if not bridge.app.realtime_active:
+                    raise HttpError(409, "realtime not running")
+                bridge.run(bridge.app.say(text, mode), 20)
+                self._reply(200, {"ok": True})
+            elif path == "/client-state":
+                state = _field(data, "state", str, required=True, max_len=40)
+                if state in ("connected", "failed", "disconnected", "closed"):
+                    mapped = {"connected": "media-connected", "failed": "media-failed"}.get(state, "media-" + state)
+                    emit({"type": "realtime", "state": mapped, "by": "page"})
+                else:
+                    LOG.write("PAGE", loggable(json.dumps(data, ensure_ascii=False), 2000))
+                self._reply(200, {"ok": True})
+            elif path == "/answer":
+                rid = _field(data, "id", str, required=True, max_len=200)
+                answer = _field(data, "answer", str, max_len=20000, default="")
+                status = _field(data, "status", str, max_len=32, default="ok")
+                if not ANSWER_STATUSES.match(status):
+                    raise HttpError(400, "bad status")
+                turn_id = _field(data, "turnId", str, max_len=200)
+                refusal = bridge.run(_answer_refusal(bridge.app, rid), 10)
+                if refusal:
+                    # Only requests this helper emitted in the current realtime session: nothing
+                    # is recorded for any other id.
+                    LOG.write("HTTP", f"answer refused: {refusal}")
+                    self._reply(403 if refusal == "unknown request id" else 409, {"ok": False, "error": refusal})
+                    return
+                os.makedirs(LOG_DIR, exist_ok=True)
+                with open(ANSWERS_PATH, "a", encoding="utf-8") as f:
+                    f.write(json.dumps({"receivedAt": datetime.now().isoformat(), "id": rid, "status": status,
+                                        "chars": len(answer), "sha256": short_hash(answer),
+                                        "turnId": turn_id}, ensure_ascii=False) + "\n")
+                emit({"type": "ack", "id": rid, "status": status})
+                res = bridge.run(bridge.app.deliver_answer(rid, answer, status), 30)
+                self._reply(200 if res.get("ok") else 409, res)
+            elif path == "/reopen":
+                key = mint_page_key()
+                url = page_url(self.server.server_address[1], key)
+                opened = bool(bridge.args.open)
+                if opened:
+                    open_page(url)
+                else:
+                    emit({"type": "page_url", "pageUrl": url})  # stdout only (never logged)
+                self._reply(200, {"ok": True, "opened": opened})
+            elif path == "/shutdown":
+                self._reply(200, {"ok": True})
+                bridge.loop.call_soon_threadsafe(_stop_cb, "shutdown requested")
+            else:
+                self._reply(404, {"ok": False, "error": "not found"})
+
         def log_message(self, fmt, *args):
-            if "/events" not in (args[0] if args else ""):
-                LOG.write("HTTP", fmt % args)
+            line = fmt % args
+            if "/events" not in line:
+                LOG.write("HTTP", _PAGE_KEY_IN_PATH.sub(r"\1[hidden]", line))
 
     return Handler
+
+
+async def _answer_refusal(app: "AppServer", rid: str) -> str | None:
+    return app.answer_refusal(rid)
+
+
+PAGE_REFUSED = (
+    "<!doctype html><meta charset=utf-8><title>Voice Mod</title>"
+    "<body style='font:15px system-ui,sans-serif;margin:2em'>"
+    "<h1>Voice Mod: this link is used up</h1><p>The voice page opens only through the one-time link "
+    "the helper starts Edge with. Run <code>/voice page</code> in Claude Code to open it again.</p>"
+).encode("utf-8")
+
+
+def open_page(url: str):
+    """Opens the voice page in an Edge app window."""
+    subprocess.Popen(["cmd", "/c", "start", "", "msedge", f"--app={url}"],
+                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
 
 # ---------------------------------------------------------------- headless self test (no mic, no browser)
@@ -1355,7 +1844,7 @@ async def selftest(app: AppServer, args, voice: str | None):
                        for s, o in _events)
 
     for mode in ("text", "speech"):
-        LOG.write("SELFTEST", f"append{mode} -> {args.selftest_text!r}")
+        LOG.write("SELFTEST", f"append{mode} -> {args.selftest_text!r}" if DEBUG_LOG else f"append{mode}")
         try:
             await app.say(args.selftest_text, mode)
         except Exception as e:
@@ -1446,7 +1935,7 @@ async def selftest_handoff(app: AppServer, args, voice: str | None):
             obj, t = None, "non-json"
         dc_types[t] = dc_types.get(t, 0) + 1
         if "delegation" in t or t in ("error", "session.context.appended"):
-            LOG.write("SELFTEST", f"datachannel {t}: {json.dumps(obj, ensure_ascii=False)[:1500]}")
+            LOG.write("SELFTEST", f"datachannel {t}: {loggable(json.dumps(obj, ensure_ascii=False), 1500)}")
 
     @pc.on("connectionstatechange")
     async def _on_state():
@@ -1482,7 +1971,7 @@ async def selftest_handoff(app: AppServer, args, voice: str | None):
             LOG.write("SELFTEST", f"playing {args.selftest_audio} as the microphone")
             track.play()
         else:
-            LOG.write("SELFTEST", f"appendText (user) -> {args.selftest_handoff!r}")
+            LOG.write("SELFTEST", f"appendText (user) -> {args.selftest_handoff!r}" if DEBUG_LOG else "appendText (user)")
             await app.say(args.selftest_handoff, "text")
         req = None
         for _ in range(int(args.selftest_wait * 2)):
@@ -1497,7 +1986,7 @@ async def selftest_handoff(app: AppServer, args, voice: str | None):
             result["filler"] = [o.get("text") for o in events_after(seq0, "transcript", "assistant")]
             seq1 = _seq
             fake = args.selftest_answer
-            LOG.write("SELFTEST", f"fake answer for {req['id']}: {fake!r}")
+            LOG.write("SELFTEST", f"fake answer for {req['id']} ({len(fake)} chars)")
             await app.deliver_answer(req["id"], fake, "ok")
             # A filler that was already being spoken can finish right after the append (seen live:
             # its transcript/done arrived 0.3 s later), so collect until 6 s of quiet instead of
@@ -1556,17 +2045,18 @@ async def amain(args):
         await app.handshake()
 
         bridge = Bridge(loop, app, args)
-        server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(bridge))
-        server.daemon_threads = True
+        server = LimitedHTTPServer(("127.0.0.1", args.port), make_handler(bridge))
         threading.Thread(target=server.serve_forever, daemon=True).start()
         port = server.server_address[1]
         url = f"http://127.0.0.1:{port}/"
+        first = page_url(port, mint_page_key())
+        # token and pageUrl go to stdout (the Mod) only: emit() keeps them out of the log and the
+        # page's event buffer.
         emit({"type": "ready", "port": port, "pid": os.getpid(), "url": url, "threadId": app.thread_id,
-              "log": LOG.path, "token": TOKEN})
+              "log": LOG.path, "debugLog": DEBUG_LOG, "token": TOKEN, "pageUrl": first})
         emit({"type": "voice", "event": "selected", "voice": bridge.voice, "source": bridge.voice_source})
         if args.open:
-            subprocess.Popen(["cmd", "/c", "start", "", "msedge", f"--app={url}"],
-                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            open_page(first)
 
         async def watchdogs():
             while not stop_event.is_set():
@@ -1599,6 +2089,11 @@ async def amain(args):
             stop("selftest finished")
         await stop_event.wait()
         wd.cancel()
+    except McpIsolationError as e:
+        # Refuse to start: no ready line, no page, no realtime session.
+        LOG.write("ERROR", f"MCP isolation not confirmed: {e}")
+        emit({"type": "mcp_blocked", "reason": str(e)})
+        reason["text"] = f"refused: {e}"
     except Exception as e:
         LOG.write("ERROR", f"fatal: {e!r}")
         emit({"type": "realtime", "state": "error", "message": str(e)})
@@ -1640,14 +2135,20 @@ def main():
     parser.add_argument("--selftest-answer",
                         default="The folder holds two subfolders, helper and hooks, and a README file.",
                         help="fake Claude answer used by --selftest-handoff")
+    parser.add_argument("--debug-log", action="store_true",
+                        help="also log conversation text (transcripts, requests; redacted). Default: metadata "
+                             "only. Same as \"debugLog\": true in settings.json")
     args = parser.parse_args()
-    global LABEL, PERSONA
+    global LABEL, PERSONA, DEBUG_LOG
     if args.data_dir:
         set_data_dir(args.data_dir)
     LABEL = args.label.strip()[:60]
+    DEBUG_LOG = bool(args.debug_log or _read_settings_quietly().get("debugLog") is True)
     LOG = Log()
     PERSONA = load_persona(load_settings())
-    LOG.write("INFO", f"voice_helper start args={vars(args)}")
+    shown = {k: (v if DEBUG_LOG or not isinstance(v, str) or k in ("version", "voice", "codex", "data_dir")
+                 else f"<{len(v)} chars>") for k, v in vars(args).items()}
+    LOG.write("INFO", f"voice_helper start args={shown} debugLog={DEBUG_LOG} logsPruned={len(LOG.pruned)}")
     try:
         asyncio.run(amain(args))
     except KeyboardInterrupt:

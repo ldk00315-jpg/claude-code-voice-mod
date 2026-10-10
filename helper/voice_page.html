@@ -34,6 +34,7 @@
 <body>
 <main>
   <h1>Voice Mod</h1>
+  <div id="blocked" class="card bad" hidden></div>
   <div class="card">
     <div class="row">
       <label for="label">Thread name:</label>
@@ -71,10 +72,15 @@
       <button id="send" disabled>Send</button>
     </div>
   </div>
-  <div class="card"><ul id="log"></ul></div>
+  <div class="card"><ul id="log"></ul>
+    <p id="logNote" class="muted">This list lives in this window only. The helper's log file keeps metadata (states, errors, ids, lengths), not what was said, unless debug logging is on.</p>
+  </div>
 </main>
 <script>
 const $ = id => document.getElementById(id);
+// The one-time link (?k=...) is used up once this page loaded: drop it from the address bar
+// and from this history entry.
+try { history.replaceState(null, '', '/'); } catch (_) {}
 // Per-run secret the helper writes into the page it serves; every call but GET / needs it.
 const TOKEN = (document.querySelector('meta[name="voice-token"]') || {}).content || '';
 const api = (path, init) => fetch(path, { ...(init || {}), headers: { ...((init || {}).headers || {}), 'X-Voice-Token': TOKEN } });
@@ -93,6 +99,15 @@ function waitDc(type, ms) {  // resolves true when the event arrived, false afte
 }
 const SOURCE_LABEL = { cli:'--voice', settings:'saved', default:'codex default' };
 
+// MCP isolation could not be confirmed: the helper refuses realtime sessions.
+function showBlocked(reason) {
+  const b = $('blocked');
+  b.textContent = 'Voice is blocked: ' + (reason || 'MCP isolation not confirmed') +
+    '. No realtime session will start. See the README (MCP isolation), then run /voice off and /voice on.';
+  b.hidden = false;
+  $('start').disabled = true; $('preview').disabled = true;
+}
+let blocked = false;
 function setState(text, cls) { const s = $('state'); s.textContent = text; s.className = cls || ''; }
 function addLog(who, text) {
   const li = document.createElement('li');
@@ -110,8 +125,8 @@ function setActive(voice, purpose) {
 
 function refreshButtons() {
   const idle = mode === 'idle';
-  $('start').disabled = !idle;
-  $('preview').disabled = !idle || !voiceInfo;
+  $('start').disabled = !idle || blocked;
+  $('preview').disabled = !idle || !voiceInfo || blocked;
   $('voice').disabled = !idle || !voiceInfo;
   $('stop').disabled = idle || mode === 'starting';
 }
@@ -156,7 +171,11 @@ function showLabel(label) {
   if (document.activeElement !== $('label')) $('label').value = label || '';
 }
 async function loadLabel() {
-  try { const j = await (await api('/health')).json(); showLabel(j.label || ''); } catch (e) {}
+  try {
+    const j = await (await api('/health')).json(); showLabel(j.label || '');
+    if (j.blocked) { blocked = true; showBlocked(j.blocked); }
+    if (j.debugLog) $('logNote').textContent = 'Debug logging is on: the log file of the helper also keeps transcripts and requests (secret-looking strings redacted), for 7 days at most.';
+  } catch (e) {}
 }
 async function saveLabel() {
   const label = $('label').value.trim();
@@ -190,6 +209,10 @@ async function poll() {
           else if (mode === 'conversation') setState('disconnected (' + (e.reason || '') + ')', 'bad');
         }
         else if (e.state === 'started') addLog('Info', 'realtime started, version=' + e.version);
+      }
+      else if (e.type === 'mcp_blocked') {
+        blocked = true; showBlocked(e.reason); addLog('Blocked', e.reason || '');
+        if (preview) finishPreview('blocked'); else if (mode !== 'idle') { cleanup(); setState('blocked', 'bad'); }
       }
       else if (e.type === 'request') addLog('Request → Claude', e.text);
       else if (e.type === 'answer_delivered') addLog('Result → speech', (e.via || '') + (e.status && e.status !== 'ok' ? ' (' + e.status + ')' : ''));

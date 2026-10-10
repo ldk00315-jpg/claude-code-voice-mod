@@ -3,10 +3,13 @@
 Run:  uv run --project helper python -m unittest discover -s helper/tests -v
 """
 import asyncio
+import io
 import json
 import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -20,6 +23,7 @@ class _Log:
 
 vh.LOG = _Log()
 EMITTED = []
+REAL_EMIT = vh.emit
 vh.emit = lambda obj: EMITTED.append(obj)
 
 
@@ -153,7 +157,8 @@ class McpOverrides(unittest.TestCase):
                         '[features]\napps = true\n')
             names = vh.user_mcp_server_names(p)
         self.assertEqual(names, ["clock", "we ird"])
-        self.assertEqual(vh.mcp_disable_overrides(names), ["mcp_servers.clock.enabled=false"])
+        self.assertEqual(vh.mcp_disable_overrides(names),
+                         ['mcp_servers={clock={enabled=false}, "we ird"={enabled=false}}'])
 
     def test_missing_config(self):
         self.assertEqual(vh.user_mcp_server_names(r"Z:\nope\config.toml"), [])
@@ -182,6 +187,7 @@ class HandoffFlow(unittest.TestCase):
 
     def test_answer_needs_running_realtime(self):
         app = FakeApp()
+        app._on_handoff({"handoff_id": "item_1", "input_transcript": "調べて"})
         res = asyncio.run(app.deliver_answer("item_1", "答え", "ok"))
         self.assertFalse(res["ok"])
         self.assertEqual(app.calls, [])
@@ -343,63 +349,262 @@ class AnswerPrivacy(unittest.TestCase):
 
 
 class McpDisable(unittest.TestCase):
-    def test_enabled_names_from_effective_config(self):
-        cfg = {"mcp_servers": {"a": {"enabled": False}, "b": {"command": "x"}, "c": {"enabled": True},
-                               "d.e": {}}}
-        self.assertEqual(vh.enabled_mcp_server_names(cfg), ["b", "c", "d.e"])
-        self.assertEqual(vh.enabled_mcp_server_names({}), [])
-        self.assertEqual(vh.thread_mcp_overrides(["b", "c", "d.e"]),
-                         {"mcp_servers.b.enabled": False, "mcp_servers.c.enabled": False})
+    """F4: every MCP server off, names with dots included, and fail closed when unsure."""
 
-    def test_handshake_passes_thread_overrides(self):
+    def setUp(self):
+        EMITTED.clear()
+
+    def test_names_from_effective_config(self):
+        cfg = {"mcp_servers": {"a": {"enabled": False}, "b": {"command": "x"}, "c": {"enabled": True},
+                               "corp.files": {}}}
+        self.assertEqual(vh.all_mcp_server_names(cfg), ["a", "b", "c", "corp.files"])
+        self.assertEqual(vh.enabled_mcp_server_names(cfg), ["b", "c", "corp.files"])
+        self.assertEqual(vh.all_mcp_server_names({}), [])
+        self.assertEqual(vh.thread_mcp_overrides(["a", "corp.files"]),
+                         {"mcp_servers": {"a": {"enabled": False}, "corp.files": {"enabled": False}}})
+        self.assertEqual(vh.thread_mcp_overrides([]), {})
+
+    def test_cli_override_is_one_toml_inline_table(self):
+        import tomllib
+        names = ["clock", "corp.files", "service@home", 'we"ird']
+        (override,) = vh.mcp_disable_overrides(names)
+        key, value = override.split("=", 1)  # codex splits at the first "=" only
+        self.assertEqual(key, "mcp_servers")  # no dotted path: names with dots stay whole
+        parsed = tomllib.loads("_x_ = " + value)["_x_"]  # how codex parses the value
+        self.assertEqual(parsed, {n: {"enabled": False} for n in names})
+        self.assertEqual(vh.mcp_disable_overrides([]), [])
+
+    def _app(self, responses):
         app = FakeApp()
 
         async def request(method, params, timeout=60):
             app.calls.append((method, params))
-            if method == "config/read":
-                return {"config": {"mcp_servers": {"proj": {"command": "x"}, "off": {"enabled": False}}}}
-            if method == "thread/start":
-                return {"thread": {"id": "T1"}}
-            return {}
+            r = responses.get(method, {})
+            if isinstance(r, Exception):
+                raise r
+            return r(params) if callable(r) else r
 
         async def notify(method, params=None):
             pass
 
         app.request, app.notify = request, notify
-        app.check_mcp_servers = lambda: asyncio.sleep(0)
+        app.thread_id = None
+        return app
+
+    OK = {
+        "config/read": {"config": {"mcp_servers": {"proj": {"command": "x"}, "corp.files": {"command": "y"},
+                                                   "off": {"enabled": False}}}},
+        "thread/start": {"thread": {"id": "T1"}},
+        "mcpServerStatus/list": {"data": [{"name": "proj", "runtimeStatus": "disabled"},
+                                          {"name": "corp.files", "runtimeStatus": "disabled"},
+                                          {"name": "off", "runtimeStatus": "disabled"}], "nextCursor": None},
+    }
+
+    def test_handshake_disables_every_server_and_checks_the_status_list(self):
+        app = self._app(dict(self.OK))
+        app.cli_mcp_names = ["clock"]
         asyncio.run(app.handshake())
         start = dict(app.calls)["thread/start"]
-        self.assertEqual(start["config"], {"mcp_servers.proj.enabled": False})
+        self.assertEqual(start["config"], {"mcp_servers": {n: {"enabled": False}
+                                                           for n in ["clock", "corp.files", "off", "proj"]}})
+        methods = [m for m, _ in app.calls]
+        self.assertLess(methods.index("thread/start"), methods.index("mcpServerStatus/list"))
 
-    def test_started_server_is_reported_once(self):
-        EMITTED.clear()
-        app = FakeApp()
-        asyncio.run(app._on_notification("mcpServer/startupStatus/updated",
-                                         {"name": "clock", "status": "starting"}, "{}"))
-        asyncio.run(app._on_notification("mcpServer/startupStatus/updated",
-                                         {"name": "clock", "status": "starting"}, "{}"))
-        self.assertEqual([e for e in EMITTED if e["type"] == "mcp_warning"],
-                         [{"type": "mcp_warning", "name": "clock", "status": "starting"}])
+    def test_status_list_is_paged(self):
+        pages = {None: {"data": [{"name": "a", "runtimeStatus": "disabled"}], "nextCursor": "1"},
+                 "1": {"data": [{"name": "b", "runtimeStatus": "connected"}], "nextCursor": None}}
+        app = self._app({**self.OK, "mcpServerStatus/list": lambda p: pages[p.get("cursor")]})
+        with self.assertRaises(vh.McpIsolationError) as cm:
+            asyncio.run(app.handshake())
+        self.assertIn("'b': 'connected'", str(cm.exception))
 
-    def test_status_list_check(self):
-        EMITTED.clear()
+    def test_fail_closed(self):
+        cases = {
+            "config/read error": {**self.OK, "config/read": vh.RpcError("boom")},
+            "config/read without config": {**self.OK, "config/read": {}},
+            "status list error": {**self.OK, "mcpServerStatus/list": vh.RpcError("boom")},
+            "status list without data": {**self.OK, "mcpServerStatus/list": {}},
+        }
+        for name in ("starting", "connected", "notStarted", "failed", "authenticationRequired", None):
+            cases[f"server {name}"] = {**self.OK, "mcpServerStatus/list": {
+                "data": [{"name": "corp.files", "runtimeStatus": name}]}}
+        for label, responses in cases.items():
+            app = self._app(responses)
+            with self.assertRaises(vh.McpIsolationError, msg=label):
+                asyncio.run(app.handshake())
+
+    def test_startup_notification_blocks_realtime(self):
         app = FakeApp()
+        app.realtime_active = True
+
+        async def run():
+            await app._on_notification("mcpServer/startupStatus/updated",
+                                       {"name": "corp.files", "status": "starting"}, "{}")
+            await asyncio.sleep(0.05)  # the stop runs as its own task
+            with self.assertRaises(vh.McpIsolationError):
+                await app.start_realtime("v=0", "v3", "cove")
+
+        asyncio.run(run())
+        self.assertFalse(app.realtime_active)
+        self.assertIn("thread/realtime/stop", [m for m, _ in app.calls])
+        self.assertNotIn("thread/realtime/start", [m for m, _ in app.calls])
+        blocked = [e for e in EMITTED if e["type"] == "mcp_blocked"]
+        self.assertEqual(len(blocked), 1)
+        self.assertIn("corp.files", blocked[0]["reason"])
+
+
+class RealtimeLock(unittest.TestCase):
+    """F6: start and stop of the realtime session run one at a time."""
+
+    def test_starts_and_stops_do_not_interleave(self):
+        app = FakeApp()
+        order = []
 
         async def request(method, params, timeout=60):
-            return {"data": [{"name": "a", "runtimeStatus": "disabled"}, {"name": "b", "runtimeStatus": "connected"}]}
+            order.append(method + ">")
+            await asyncio.sleep(0.01)
+            if method == "thread/realtime/start":
+                app._sdp_wait.set_result("answer-sdp")
+            order.append(method + "<")
+            return {}
 
         app.request = request
 
         async def run():
-            real_sleep = asyncio.sleep
-            vh.asyncio.sleep = lambda s: real_sleep(0)
-            try:
-                await app.check_mcp_servers()
-            finally:
-                vh.asyncio.sleep = real_sleep
+            await asyncio.gather(app.start_realtime("o1", "v3", "cove"), app.stop_realtime(),
+                                 app.start_realtime("o2", "v3", "cove"))
 
         asyncio.run(run())
-        self.assertEqual([e["name"] for e in EMITTED if e["type"] == "mcp_warning"], ["b"])
+        for i in range(0, len(order), 2):  # every call ends before the next one starts
+            self.assertEqual(order[i][:-1], order[i + 1][:-1], order)
+        self.assertEqual(order[-2:], ["thread/realtime/start>", "thread/realtime/start<"])
+
+
+class SecretAssignments(unittest.TestCase):
+    """F5: a secret-named value is hidden whatever its form, short numbers included."""
+
+    def test_secret_names_hide_any_value(self):
+        cases = [
+            ("password = 123456", "123456"), ("password=1234", "1234"), ("PIN: 0000", "0000"),
+            ('{"pin": 1234}', "1234"), ("{'password': '42'}", "42"), ("DB_PASSWORD=987654", "987654"),
+            ("export API_KEY=12345", "12345"), ("apiKey: \"9\"", "9"), ("token=7", "=7"),
+            ("passcode: 246810", "246810"), ("passwd: 1", ": 1"), ('"api_key":"12"', "12"),
+            ("The password is 123456.", "123456"), ("my pin is 4321", "4321"), ("PIN is 7", "is 7"),
+            ("secret is hunter2", "hunter2"), ("pwd = 99", "99"), ("clientSecret=\"x y z\"", "x y z"),
+            ("id:token=abc", "abc"), ("PASSWORD: 'p@ss w0rd'", "p@ss"),
+            ("パスワードは123456です", "123456"), ("暗証番号：1234", "1234"), ("PINコードは「0042」", "0042"),
+        ]
+        for text, secret in cases:
+            out = vh.redact_secrets(text)
+            self.assertNotIn(secret, out, (text, out))
+            self.assertIn("[REDACTED]", out, text)
+
+    def test_harmless_names_keep_numbers(self):
+        for text in ["max_tokens = 4096", "timeout: 30", "port=8080", "token_count: 12", "prompt_tokens: 12",
+                     '"max_output_tokens": 2048', "The password is wrong.", "the token is expired"]:
+            self.assertEqual(vh.redact_secrets(text), text)
+        self.assertEqual(vh.redact_secrets("The password is 123456."), "The password is [REDACTED].")
+
+    def test_send_path_hides_a_short_numeric_password(self):
+        app = FakeApp()
+        app.realtime_active = True
+        app._on_handoff({"handoff_id": "h1", "input_transcript": "what is the door code"})
+
+        async def run():
+            res = await app.deliver_answer("h1", "The password is 482913 and pin: 77.", "ok")
+            app.realtime_active = False
+            await asyncio.sleep(0.6)
+            return res
+
+        self.assertTrue(asyncio.run(run())["ok"])
+        sent = app.calls[0][1]["text"]
+        self.assertNotIn("482913", sent)
+        self.assertNotIn("77", sent)
+
+
+class Logging(unittest.TestCase):
+    """F5: no conversation text in the log by default; retention at startup."""
+
+    def setUp(self):
+        self.old = (vh.LOG, vh.DEBUG_LOG, vh.emit, vh.DATA_DIR)
+        self.dir = tempfile.TemporaryDirectory()
+        vh.set_data_dir(self.dir.name)
+        vh.emit = REAL_EMIT
+
+    def tearDown(self):
+        if isinstance(vh.LOG, vh.Log):
+            vh.LOG.close()
+        vh.LOG, vh.DEBUG_LOG, vh.emit = self.old[0], self.old[1], self.old[2]
+        vh.set_data_dir(self.old[3])
+        self.dir.cleanup()
+
+    def _log_text(self):
+        vh.LOG.close()
+        with open(vh.LOG.path, encoding="utf-8") as f:
+            return f.read()
+
+    def _talk(self):
+        old_out = sys.stdout
+        sys.stdout = type("Null", (), {"buffer": io.BytesIO()})()
+        try:
+            vh.emit({"type": "transcript", "role": "user", "text": "my secret plan for friday"})
+            vh.emit({"type": "request", "id": "h1", "text": "read the diary", "userSaid": ["read my diary"]})
+            vh.emit({"type": "ready", "port": 1, "token": "TOKEN-VALUE", "pageUrl": "http://127.0.0.1:1/?k=KEYVALUE"})
+            vh.LOG.write("RPC<", vh.loggable(json.dumps({"method": "thread/realtime/transcript/done",
+                                                         "params": {"role": "assistant", "text": "said aloud"}})))
+        finally:
+            sys.stdout = old_out
+
+    def test_default_keeps_metadata_only(self):
+        vh.DEBUG_LOG = False
+        vh.LOG = vh.Log()
+        self._talk()
+        text = self._log_text()
+        for private in ("secret plan", "diary", "said aloud", "TOKEN-VALUE", "KEYVALUE"):
+            self.assertNotIn(private, text)
+        self.assertIn('"type": "transcript"', text)
+        self.assertIn('"text": "<25 chars>"', text)
+        self.assertIn('"id": "h1"', text)
+        self.assertIn("thread/realtime/transcript/done", text)
+
+    def test_debug_log_keeps_text_redacted(self):
+        vh.DEBUG_LOG = True
+        vh.LOG = vh.Log()
+        self._talk()
+        vh.LOG.write("OUT", "password = 123456")
+        text = self._log_text()
+        self.assertIn("secret plan", text)
+        self.assertIn("said aloud", text)
+        self.assertNotIn("TOKEN-VALUE", text)
+        self.assertNotIn("KEYVALUE", text)
+        self.assertNotIn("123456", text)
+
+    def test_retention(self):
+        logs = os.path.join(self.dir.name, "logs")
+        os.makedirs(logs)
+        now = time.time()
+
+        def make(name, size, age_days):
+            path = os.path.join(logs, name)
+            with open(path, "wb") as f:
+                f.write(b"x" * size)
+            os.utime(path, (now - age_days * 86400, now - age_days * 86400))
+            return path
+
+        old = make("voice-20200101-000000.log", 10, 8)
+        a = make("voice-a.log", 9 * 1024 * 1024, 3)
+        b = make("voice-b.log", 9 * 1024 * 1024, 2)
+        c = make("voice-c.log", 9 * 1024 * 1024, 1)
+        other = make("not-ours.txt", 10, 30)
+        answers = make("voice-answers.jsonl", 2 * 1024 * 1024, 0)
+        removed = vh.prune_logs(logs, now=now)
+        self.assertFalse(os.path.exists(old))  # older than 7 days
+        self.assertFalse(os.path.exists(a))  # oldest, over 20 MB in all
+        self.assertTrue(os.path.exists(b) and os.path.exists(c))
+        self.assertTrue(os.path.exists(other))  # not the helper's
+        self.assertFalse(os.path.exists(answers))
+        self.assertTrue(os.path.exists(os.path.join(logs, "voice-answers.1.jsonl")))  # rotated
+        self.assertIn(old, removed)
 
 
 class HttpAuth(unittest.TestCase):
@@ -408,15 +613,22 @@ class HttpAuth(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         import threading
-        from http.server import ThreadingHTTPServer
 
-        cls.old_token = vh.TOKEN
+        cls.old_token, cls.old_dir, cls.old_log = vh.TOKEN, vh.DATA_DIR, vh.LOG
+        cls.tmp = tempfile.TemporaryDirectory()
+        vh.set_data_dir(cls.tmp.name)
+        cls.lines = []
+        vh.LOG = type("Rec", (), {"write": lambda self, kind, text: cls.lines.append((kind, text))})()
         vh.TOKEN = "tok-" + "Zx9Yw8Vu7Ts6Rq5Po4Nm3Lk2Ji1Hg0Fe<&\""
-        app = FakeApp()
+        cls.loop = asyncio.new_event_loop()
+        threading.Thread(target=cls.loop.run_forever, daemon=True).start()
+        app = cls.app = FakeApp()
         bridge = type("B", (), {})()
         bridge.app, bridge.voice, bridge.last_activity = app, "cove", 0
-        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), vh.make_handler(bridge))
-        cls.server.daemon_threads = True
+        bridge.args = type("A", (), {"open": False, "version": "v3"})()
+        bridge.loop = cls.loop
+        bridge.run = lambda coro, timeout: asyncio.run_coroutine_threadsafe(coro, cls.loop).result(timeout)
+        cls.server = vh.LimitedHTTPServer(("127.0.0.1", 0), vh.make_handler(bridge))
         cls.port = cls.server.server_address[1]
         threading.Thread(target=cls.server.serve_forever, daemon=True).start()
 
@@ -424,19 +636,24 @@ class HttpAuth(unittest.TestCase):
     def tearDownClass(cls):
         cls.server.shutdown()
         cls.server.server_close()
-        vh.TOKEN = cls.old_token
+        cls.loop.call_soon_threadsafe(cls.loop.stop)
+        time.sleep(0.05)
+        cls.loop.close()
+        vh.TOKEN, vh.LOG = cls.old_token, cls.old_log
+        vh.set_data_dir(cls.old_dir)
+        cls.tmp.cleanup()
         vh.LABEL = ""
 
-    def call(self, method, path, headers=None, body=None, host=None):
+    def call(self, method, path, headers=None, body=None, host=None, raw=None, length=None):
         import http.client
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
         try:
             conn.putrequest(method, path, skip_host=True)
             conn.putheader("Host", host or f"127.0.0.1:{self.port}")
-            data = json.dumps(body).encode() if body is not None else b""
+            data = raw if raw is not None else (json.dumps(body).encode() if body is not None else b"")
             if method == "POST":
                 conn.putheader("Content-Type", "application/json")
-                conn.putheader("Content-Length", str(len(data)))
+                conn.putheader("Content-Length", str(len(data) if length is None else length))
             for k, v in (headers or {}).items():
                 conn.putheader(k, v)
             conn.endheaders(data if method == "POST" else None)
@@ -447,12 +664,80 @@ class HttpAuth(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_page_is_open_and_carries_the_token(self):
+    def test_page_needs_a_one_time_key(self):
         status, page = self.call("GET", "/")
+        self.assertEqual(status, 403)
+        self.assertNotIn(b"voice-token", page)
+        self.assertEqual(self.call("GET", "/?k=guess")[0], 403)
+        key = vh.mint_page_key()
+        status, page = self.call("GET", f"/?k={key}")
         self.assertEqual(status, 200)
         escaped = vh.html.escape(vh.TOKEN, quote=True)
         self.assertIn(f'<meta name="voice-token" content="{escaped}">'.encode(), page)
         self.assertNotIn(vh.TOKEN.encode(), page)  # only in its escaped form
+        self.assertEqual(self.call("GET", f"/?k={key}")[0], 403)  # used up
+        self.assertFalse([t for _, t in self.lines if key in t])  # the key is never logged
+
+    def test_reopen_mints_a_new_link(self):
+        EMITTED.clear()
+        ok = {"X-Voice-Token": vh.TOKEN}
+        self.assertEqual(self.call("POST", "/reopen", body={})[0], 403)
+        status, body = self.call("POST", "/reopen", ok, {})
+        self.assertEqual((status, json.loads(body)["opened"]), (200, False))
+        url = [e for e in EMITTED if e["type"] == "page_url"][-1]["pageUrl"]
+        path = url.split(f":{self.port}", 1)[1]
+        self.assertEqual(self.call("GET", path)[0], 200)
+        self.assertEqual(self.call("GET", path)[0], 403)
+
+    def test_body_limits_and_types(self):
+        ok = {"X-Voice-Token": vh.TOKEN}
+        self.assertEqual(self.call("POST", "/label", ok, raw=b"", length=-1)[0], 400)
+        self.assertEqual(self.call("POST", "/label", ok, raw=b"x" * (17 * 1024))[0], 413)
+        self.assertEqual(self.call("POST", "/label", ok, raw=b"", length=2 * 1024 * 1024)[0], 413)
+        self.assertEqual(self.call("POST", "/label", ok, raw=b"not json")[0], 400)
+        self.assertEqual(self.call("POST", "/label", ok, raw=b"[1, 2]")[0], 400)
+        self.assertEqual(self.call("POST", "/label", ok, {"label": 5})[0], 400)
+        self.assertEqual(self.call("POST", "/say", ok, {"text": "hi", "mode": "shout"})[0], 400)
+        self.assertEqual(self.call("POST", "/offer", ok, {"sdp": ["no"]})[0], 400)
+        self.assertEqual(self.call("POST", "/answer", ok, {"id": "x", "answer": {"a": 1}})[0], 400)
+        self.assertEqual(self.call("GET", "/events?since=abc", ok)[0], 400)
+
+    def test_answer_needs_an_emitted_request_of_this_session(self):
+        ok = {"X-Voice-Token": vh.TOKEN}
+        app = self.app
+        app.requests.clear()
+        status, _ = self.call("POST", "/answer", ok, {"id": "made-up", "answer": "x", "status": "ok"})
+        self.assertEqual(status, 403)
+        self.assertNotIn("made-up", app.requests)  # no entry created
+        self.assertFalse(os.path.exists(vh.ANSWERS_PATH))
+        app._on_handoff({"handoff_id": "h-old", "input_transcript": "old"})
+        app._session_gen += 2  # the realtime session was stopped and started again
+        status, _ = self.call("POST", "/answer", ok, {"id": "h-old", "answer": "x", "status": "ok"})
+        self.assertEqual(status, 409)
+        app._on_handoff({"handoff_id": "h-now", "input_transcript": "now"})
+        status, body = self.call("POST", "/answer", ok, {"id": "h-now", "answer": "x", "status": "ok"})
+        self.assertEqual(status, 409)  # accepted, but realtime is not running in this test
+        self.assertEqual(json.loads(body)["error"], "realtime not running")
+        self.assertTrue(os.path.exists(vh.ANSWERS_PATH))
+
+    def test_handler_threads_are_capped(self):
+        import socket
+        server = vh.LimitedHTTPServer(("127.0.0.1", 0), self.server.RequestHandlerClass, max_handlers=1)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            slow = socket.create_connection(("127.0.0.1", port))
+            slow.sendall(b"GET /health HTTP/1.1\r\n")  # holds the only handler (headers never end)
+            time.sleep(0.2)
+            busy = socket.create_connection(("127.0.0.1", port))
+            busy.sendall(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+            busy.settimeout(5)
+            self.assertTrue(busy.recv(100).startswith(b"HTTP/1.0 503"))
+            busy.close()
+            slow.close()
+        finally:
+            server.shutdown()
+            server.server_close()
 
     def test_endpoints_need_the_token(self):
         self.assertEqual(self.call("GET", "/health")[0], 403)
@@ -476,10 +761,11 @@ class HttpAuth(unittest.TestCase):
                        f"https://127.0.0.1:{self.port}"):
             self.assertEqual(self.call("GET", "/health", {**ok, "Origin": origin})[0], 403, origin)
             self.assertEqual(self.call("POST", "/label", {**ok, "Origin": origin}, {"label": "x"})[0], 403, origin)
-        # DNS rebinding: a foreign Host name is refused, even for the page.
-        self.assertEqual(self.call("GET", "/", host=f"evil.example:{self.port}")[0], 403)
+        # DNS rebinding: a foreign Host name is refused, even for the page with a valid key.
+        key = vh.mint_page_key()
+        self.assertEqual(self.call("GET", f"/?k={key}", host=f"evil.example:{self.port}")[0], 403)
         self.assertEqual(self.call("GET", "/health", ok, host=f"evil.example:{self.port}")[0], 403)
-        self.assertEqual(self.call("GET", "/", host=f"localhost:{self.port}")[0], 200)
+        self.assertEqual(self.call("GET", f"/?k={key}", host=f"localhost:{self.port}")[0], 200)
 
 
 if __name__ == "__main__":

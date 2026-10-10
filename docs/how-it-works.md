@@ -2,7 +2,7 @@
 
 Notes on the design, distilled from the investigation behind this project. Everything here was
 checked against **codex-cli 0.160.0** (the generated `codex app-server generate-ts --experimental`
-types and the `openai/codex` sources at tag `rust-v0.160.0`) and Claude Code 2.1.289 to 2.1.293.
+types and the `openai/codex` sources at tag `rust-v0.160.0`) and Claude Code 2.1.289 to 2.1.295.
 The codex realtime API is experimental: any of this can change.
 
 ## Pieces
@@ -10,10 +10,11 @@ The codex realtime API is experimental: any of this can change.
 | Path | Role |
 | --- | --- |
 | `.claude-plugin/plugin.json` | The plugin `voice`. |
-| `hooks/register.ts` | `/voice on/off/status`, spawning the helper, the request queue, turn correlation, posting answers back, wiring the guard, the thread label. |
+| `hooks/register.ts` | `/voice on/off/page/status`, spawning the helper, the request queue, turn correlation, posting answers back, wiring the guard (saved in `$.state`), the thread label. |
+| `types/index.d.ts` | The `$.state` contract: `voice.guard`, the guard's scope kept across a hot reload. |
 | `hooks/guard.ts` | The voice-origin guard: pure functions plus `VoiceScope`. |
 | `hooks/prompt.ts` | The `[voice] ...` prompt submitted to Claude Code. |
-| `tests/*.test.ts` | `claude plugin test`: guard rules, and a full round trip against a fake helper. |
+| `tests/*.test.ts` | `claude plugin test`: guard rules, a full round trip against a fake helper, and hot reloads in the middle of a voice turn. |
 | `helper/voice_helper.py` | Runs `codex app-server`, relays SDP, turns handoffs into requests and answers into speech. Standard library only. |
 | `helper/voice_page.html` | The Edge page: microphone, speaker, voice picker, preview, thread label, log. |
 | `helper/tests/` | Offline unit tests for the helper (no codex, no network). |
@@ -38,21 +39,33 @@ depend on them except for waiting on `session.started` before a preview.
 
 - Started as `codex app-server -c sandbox_mode="read-only" -c approval_policy="never"
   -c web_search="disabled" -c model_reasoning_effort="low" -c notify=[]` plus
-  `-c mcp_servers.<name>.enabled=false` for every MCP server in `config.toml` under `CODEX_HOME`
-  (default `~/.codex`; read, never written; an override for a name that is not configured would be
-  rejected by codex), and
+  one `-c mcp_servers={"<name>"={enabled=false}, ...}` naming every MCP server in `config.toml`
+  under `CODEX_HOME` (default `~/.codex`; read, never written; an entry for a name that is not
+  configured would have no transport, which codex rejects), and
   `--disable hooks multi_agent apps plugins computer_use browser_use in_app_browser
   image_generation memories js_repl goals`.
 - `thread/start`: read-only sandbox, `approvalPolicy: "never"`, `ephemeral: true`, an empty working
   folder, and developer instructions that say "do nothing, reply OK".
-- MCP servers: codex merges `-c` tables into the user's config (codex-rs `config/src/merge.rs`,
-  rust-v0.160.0), so `-c mcp_servers={}` cannot replace the table, and there is no switch for all
-  servers at once. The helper therefore reads the effective config with `config/read` (system, user,
-  profile and project layers) and passes `config: {"mcp_servers.<name>.enabled": false}` in
-  `thread/start` for every server still enabled. App and plugin servers are off through
-  `--disable apps plugins`. After `thread/start` it checks `mcpServerStatus/list`, and any
-  `mcpServer/startupStatus/updated` notification (a server starting anyway) is logged as a WARN and
-  printed as `{"type":"mcp_warning","name":...,"status":...}`.
+- MCP servers (verified against codex rust-v0.160.0 and a live `codex app-server` 0.160.0):
+  - codex merges `-c` tables into the user's config (`config/src/merge.rs`), so `-c mcp_servers={}`
+    cannot replace the table, and there is no switch for all servers at once.
+  - A `-c` key path is split at every dot, with no quoted keys (`config/src/overrides.rs`
+    `apply_toml_override`), so `mcp_servers."corp.files".enabled` would address the wrong table.
+    The value is parsed as TOML (`utils/cli/src/config_override.rs`), where a quoted key may hold
+    dots, so the helper passes **one** inline table: `-c mcp_servers={"corp.files"={enabled=false},
+    clock={enabled=false}}`. (A second `mcp_servers=` would replace the first inside the CLI layer.)
+  - `thread/start` `config` keys are applied the same way, chained after the process's `-c`
+    overrides into one CLI layer (`app-server/src/config_manager.rs` `load_with_cli_overrides`).
+    The helper passes one nested object, `{"mcp_servers": {"<name>": {"enabled": false}, ...}}`,
+    naming **every** server of the effective config (`config/read`: system, user, profile, project
+    layers), because it replaces the CLI layer's own `mcp_servers` table.
+  - App and plugin servers are off through `--disable apps plugins`.
+  - Fail closed: `config/read` must succeed, and after `thread/start` the paged
+    `mcpServerStatus/list` for the thread must succeed with every server `disabled`; otherwise the
+    helper prints `{"type":"mcp_blocked","reason":...}` and exits without a `ready` line. Any
+    `mcpServer/startupStatus/updated` notification later (a server starting anyway) prints
+    `mcp_blocked`, stops the realtime session and refuses new ones; the plugin shows it in the status
+    line and a toast, the page in a red notice.
 - `thread/realtime/start`: `includeStartupContext: false` (no workspace context for the voice model),
   `clientManagedHandoffs: true` (codex does not feed its own output to the voice model), and the
   helper's own `prompt` (it replaces codex's default backend prompt, so it must say when to delegate).
@@ -76,8 +89,8 @@ depend on them except for waiting on `session.started` before a preview.
    `turn.start` by its text containing the submitted prompt; its `turnId` is recorded. Only the
    main-loop `turn.complete` of that turn (no `agentId`) counts as the answer. Whether the turn is
    guarded does not depend on the queue: the voice marker (`[voice] ` at a line start plus the
-   notice block, `hooks/prompt.ts`) or any text the plugin ever submitted (kept until the module
-   unloads) is enough. So a voice prompt still queued in Claude Code after its request timed out or
+   notice block, `hooks/prompt.ts`) or any text the plugin submitted (the last 50, kept in the
+   session's `$.state`) is enough. So a voice prompt still queued in Claude Code after its request timed out or
    after `/voice off` runs guarded; its answer is posted as `late` if the helper still runs, else
    dropped. A typed prompt containing the whole marker is guarded too (fail-safe).
 4. The plugin posts `{id, answer, status, reason, turnId, durationMs}` to the helper's
@@ -102,6 +115,16 @@ trigger delegation; a spoken request (or a TTS wav fed as the microphone in the 
 background agents that keep running after the voice turn ended. `checkVoiceToolCall` then decides by
 tool name and, for anything with a string `command`, by regular expressions per command segment.
 
+A hot reload of the plugin runs `register` of a fresh module: its variables start over (and the
+helper child is killed), but the session's `$.state` stays. The scope (main turn id and whether it
+is voice, the voice and typed subagent ids) and the submitted texts are therefore saved as
+`voice.guard` (contract in `types/index.d.ts`) on every change, before the hook lets the event go on,
+and a new load restores them before its first guard decision. If the saved value cannot be read,
+the running turn and every subagent first seen during it are treated as voice-originated until the
+next main-loop `turn.start` or `turn.complete`. If the `tool.call` guard itself fails before
+deciding, its catch handler denies the blocked kinds of calls whatever the turn.
+`tests/reload.test.ts` loads the module twice over one state store to check this.
+
 ## Thread label
 
 `/voice on <name>` passes `--label` to the helper; the page can rename it (`POST /label`), and the
@@ -117,17 +140,36 @@ The label goes into the page title and heading and into the voice prompt.
   api_key ... = value` assignments, credentials in URLs and connection strings, and long hex or
   random base64 strings (32+ characters). This is best effort: unusual formats get through, and
   harmless long ids such as commit hashes may be hidden.
-- Local logs (in the data folder) contain transcripts and request texts, passed through the same
+- A secret-named assignment hides any value, short numbers included: `password = 123456`,
+  `"pin": 1234`, `API_KEY=12345`, `pwd: '42'`, "the password is 123456", `パスワードは1234`. A name
+  is secret when a part of it (split at `_ - .` and camelCase) is `pwd`, `pin` or `otp`, or it
+  contains `password`, `passwd`, `passphrase`, `passcode`, `secret`, `token`, `apikey`,
+  `accesskey`, `privatekey`, `credential` or `authorization`. Only an explicit list of harmless
+  names (`max_tokens`, `prompt_tokens`, `token_count`, `timeout`, `port`, ...) keeps a numeric value.
+- Local logs (in the data folder) hold **metadata only** by default: states, errors, ids, server
+  names, and the length of every other text (`metadata()` in the helper). `--debug-log` or
+  `"debugLog": true` in `settings.json` adds transcripts and request texts, passed through the same
   redaction plus SDP ICE credentials, fingerprints and candidate IPs. Answer bodies are never
   logged: the log line for an `appendText`/`appendSpeech` holds only its length and a short SHA-256
-  prefix, and `voice-answers.jsonl` records only id, status, length, that hash and turn id.
+  prefix, and `voice-answers.jsonl` records only id, status, length, that hash and turn id. At
+  startup, log files older than 7 days are deleted, then the oldest until all fit in 20 MB.
 - The helper's HTTP server listens on `127.0.0.1` only. Every request must carry `Host`
   `127.0.0.1:<port>` or `localhost:<port>` (no DNS rebinding); an `Origin`, when present, must be
-  exactly `http://127.0.0.1:<port>` or `http://localhost:<port>`; and every path except `GET /`
-  (and `/favicon.ico`) needs `X-Voice-Token`, a random per-run token (`secrets.token_urlsafe(32)`,
-  compared in constant time). The plugin gets it from the `ready` line; the page gets it embedded
-  in a `<meta>` tag by `GET /`. No CORS headers are sent, so a page of another origin cannot read
-  that response. Refusals are `403`.
+  exactly `http://127.0.0.1:<port>` or `http://localhost:<port>`. `GET /` needs `?k=<key>`, a
+  one-time key (`secrets.token_urlsafe(32)`, valid once and for 5 minutes, never logged) that the
+  helper opens Edge with; `/voice page` (`POST /reopen`) mints a new one. The page then drops it
+  from the address bar (`history.replaceState`). Every other path except `/favicon.ico` needs
+  `X-Voice-Token`, a random per-run token (compared in constant time). The plugin gets it from the
+  `ready` line; the page gets it embedded in a `<meta>` tag. No CORS headers are sent; responses
+  carry `Cache-Control: no-store` and `Referrer-Policy: no-referrer`. Refusals are `403`.
+- `POST /answer` takes only ids of requests the helper printed in the current realtime session
+  (unknown: `403`, an earlier session: `409`); nothing is recorded for a refused id.
+- Limits: bodies must be JSON objects within a per-path size (16 KB, 128 KB for `/answer`, 256 KB
+  for `/offer`; `413` past it), with typed fields (`400`); the socket read timeout is 10 s; at most
+  8 requests are handled at once (`503`); realtime start and stop run one at a time under an
+  asyncio lock, and every start or stop bumps a session generation.
+- Out of scope: other processes of the same Windows user. They can read the token and the key from
+  the plugin's or Edge's memory or command line.
 
 ## Known limits
 

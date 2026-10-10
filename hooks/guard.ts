@@ -5,6 +5,7 @@
 // (the main loop while that turn runs, and every subagent it started, including
 // background ones that outlive it). checkVoiceToolCall decides whether the call is
 // one of the blocked kinds. Typed turns are never checked.
+import type { ScopeSnapshot } from '../types'
 
 /** Why a tool call is blocked, or null when it may run. */
 export function checkVoiceToolCall(tool: string, input: Record<string, unknown>): string | null {
@@ -103,6 +104,9 @@ const COMMAND_RULES: [RegExp, string][] = [
   [/\b(register|new|set|unregister)-scheduledtask\b|\bcrontab\b/i, 'creating or changing a scheduled task'],
 ]
 
+
+const MAX_AGENTS = 500 // per set, newest kept, so a snapshot stays small
+
 /**
  * Which tool calls belong to a voice-originated turn.
  *
@@ -112,49 +116,131 @@ const COMMAND_RULES: [RegExp, string][] = [
  * and so is every subagent started in it (registered at `agent.spawn`, or at its first
  * tool call while the voice turn runs), including background subagents and their
  * own subagents after the voice turn has ended.
+ *
+ * The scope survives a hot reload through `snapshot()` / `restore()` (register.ts keeps the
+ * snapshot in `$.state`). When the snapshot cannot be read, `assumeUnknownTurn()` treats the
+ * running turn, and every subagent first seen during it, as voice-originated until the next
+ * main-loop `turn.start` or `turn.complete` (fail-safe, but typed work is not blocked for good).
  */
 export class VoiceScope {
   private mainTurn: string | null = null
   private mainIsVoice = false
+  private unknownTurn = false
   private agents = new Set<string>()
   private typedAgents = new Set<string>() // started outside a voice turn: never voice
+  /** Bumped on every change, so the owner knows when to save a snapshot. */
+  revision = 0
 
   turnStarted(turnId: string, isVoice: boolean) {
     this.mainTurn = turnId
     this.mainIsVoice = isVoice
+    this.unknownTurn = false
+    this.revision++
   }
 
   turnCompleted(turnId: string) {
+    if (this.unknownTurn) {
+      // The turn that could not be classified has ended: back to normal.
+      this.unknownTurn = false
+      this.revision++
+    }
     if (this.mainTurn === turnId) {
       this.mainTurn = null
       this.mainIsVoice = false
+      this.revision++
     }
+  }
+
+  /** Fail-safe after a reload whose saved scope could not be read. */
+  assumeUnknownTurn() {
+    this.unknownTurn = true
+    this.revision++
+  }
+
+  private get guarded(): boolean {
+    return this.mainIsVoice || this.unknownTurn
   }
 
   /** Whether a call (or spawn) made in this loop is voice-originated; learns new agents. */
   isVoice(agentId: string | undefined): boolean {
-    if (agentId === undefined) return this.mainIsVoice
+    if (agentId === undefined) return this.guarded
     if (this.agents.has(agentId)) return true
     if (this.typedAgents.has(agentId)) return false
-    if (this.mainIsVoice) {
-      this.agents.add(agentId) // a subagent first seen while the voice turn runs
+    if (this.guarded) {
+      this.addAgent(agentId) // a subagent first seen while the voice (or unknown) turn runs
       return true
     }
-    this.typedAgents.add(agentId) // a background agent of a typed turn stays typed
+    this.addTypedAgent(agentId) // a background agent of a typed turn stays typed
     return false
   }
 
   addAgent(agentId: string) {
+    if (this.agents.has(agentId)) return
+    this.typedAgents.delete(agentId)
     this.agents.add(agentId)
+    trim(this.agents)
+    this.revision++
   }
 
   addTypedAgent(agentId: string) {
-    if (!this.agents.has(agentId)) this.typedAgents.add(agentId)
+    if (this.agents.has(agentId) || this.typedAgents.has(agentId)) return
+    this.typedAgents.add(agentId)
+    trim(this.typedAgents)
+    this.revision++
   }
 
   get voiceTurnRunning(): boolean {
-    return this.mainIsVoice
+    return this.guarded
   }
+
+  get unknownTurnRunning(): boolean {
+    return this.unknownTurn
+  }
+
+  snapshot(): ScopeSnapshot {
+    return {
+      v: 1,
+      mainTurn: this.mainTurn,
+      mainIsVoice: this.mainIsVoice,
+      unknownTurn: this.unknownTurn,
+      agents: [...this.agents],
+      typedAgents: [...this.typedAgents],
+    }
+  }
+
+  /** Takes over a saved scope; false (nothing changed) when `saved` is not one. */
+  restore(saved: unknown): boolean {
+    if (!isSnapshot(saved)) return false
+    this.mainTurn = saved.mainTurn
+    this.mainIsVoice = saved.mainIsVoice
+    this.unknownTurn = saved.unknownTurn
+    this.agents = new Set(saved.agents)
+    this.typedAgents = new Set(saved.typedAgents.filter(a => !this.agents.has(a)))
+    this.revision++
+    return true
+  }
+}
+
+function trim(set: Set<string>) {
+  while (set.size > MAX_AGENTS) {
+    const oldest = set.values().next().value
+    if (oldest === undefined) break
+    set.delete(oldest)
+  }
+}
+
+function isSnapshot(x: unknown): x is ScopeSnapshot {
+  if (!x || typeof x !== 'object') return false
+  const o = x as Record<string, unknown>
+  const strings = (a: unknown) => Array.isArray(a) && a.every(s => typeof s === 'string')
+  return (
+    o.v === 1 &&
+    (o.mainTurn === null || typeof o.mainTurn === 'string') &&
+    typeof o.mainIsVoice === 'boolean' &&
+    typeof o.unknownTurn === 'boolean' &&
+    strings(o.agents) &&
+    strings(o.typedAgents)
+  )
 }
 
 export function denyMessage(reason: string): string {
