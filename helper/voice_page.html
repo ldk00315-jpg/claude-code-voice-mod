@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="voice-token" content="">
 <title>Voice Mod</title>
 <style>
   :root { --bg:#f7f6f2; --fg:#222; --muted:#666; --card:#fff; --line:#ddd; --accent:#2f6fde; --ok:#1f8a4c; --bad:#c0392b; --row:#f0efe9; }
@@ -74,6 +75,9 @@
 </main>
 <script>
 const $ = id => document.getElementById(id);
+// Per-run secret the helper writes into the page it serves; every call but GET / needs it.
+const TOKEN = (document.querySelector('meta[name="voice-token"]') || {}).content || '';
+const api = (path, init) => fetch(path, { ...(init || {}), headers: { ...((init || {}).headers || {}), 'X-Voice-Token': TOKEN } });
 let pc = null, mic = null, lastSeq = 0, polling = null, meterTimer = null, dcTimer = null, audioCtx = null;
 let mode = 'idle';      // 'idle' | 'starting' | 'conversation' | 'preview'
 let voiceInfo = null;   // GET /voices
@@ -97,7 +101,7 @@ function addLog(who, text) {
   $('log').append(li); $('log').scrollTop = $('log').scrollHeight;
 }
 async function post(path, body) {
-  const r = await fetch(path, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body || {}) });
+  const r = await api(path, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body || {}) });
   return r.json();
 }
 function setActive(voice, purpose) {
@@ -132,7 +136,7 @@ function showVoiceInfo(j) {
 }
 
 async function loadVoices() {
-  try { const r = await fetch('/voices'); showVoiceInfo(await r.json()); }
+  try { const r = await api('/voices'); showVoiceInfo(await r.json()); }
   catch (e) { $('voiceMsg').textContent = 'Could not load the voice list'; mode = 'idle'; $('start').disabled = false; }
 }
 
@@ -152,7 +156,7 @@ function showLabel(label) {
   if (document.activeElement !== $('label')) $('label').value = label || '';
 }
 async function loadLabel() {
-  try { const j = await (await fetch('/health')).json(); showLabel(j.label || ''); } catch (e) {}
+  try { const j = await (await api('/health')).json(); showLabel(j.label || ''); } catch (e) {}
 }
 async function saveLabel() {
   const label = $('label').value.trim();
@@ -168,7 +172,7 @@ $('label').onkeydown = e => { if (e.key === 'Enter') saveLabel(); };
 
 async function poll() {
   try {
-    const r = await fetch('/events?since=' + lastSeq); const j = await r.json();
+    const r = await api('/events?since=' + lastSeq); const j = await r.json();
     for (const e of j.events) {
       lastSeq = Math.max(lastSeq, e.seq);
       if (e.type === 'transcript') {
@@ -363,7 +367,7 @@ $('send').onclick = async () => {
   if (!r.ok) addLog('Error', r.error || '');
 };
 $('text').addEventListener('keydown', e => { if (e.key === 'Enter') $('send').click(); });
-window.addEventListener('beforeunload', () => { navigator.sendBeacon && navigator.sendBeacon('/stop', new Blob(['{}'], { type:'application/json' })); });
+window.addEventListener('beforeunload', () => { api('/stop', { method:'POST', keepalive:true, headers:{'Content-Type':'application/json'}, body:'{}' }).catch(() => {}); });
 polling = setInterval(poll, 500); poll(); loadVoices(); loadLabel();
 </script>
 </body>

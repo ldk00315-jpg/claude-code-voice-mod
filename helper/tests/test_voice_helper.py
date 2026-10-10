@@ -225,5 +225,262 @@ class ServerRequests(unittest.TestCase):
         self.assertIn("error", sent[4])
 
 
+# ---------------------------------------------------------------- security: redaction, HTTP token, MCP
+
+class Redactor(unittest.TestCase):
+    SECRETS = [
+        "sk-proj-" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6",
+        "sk-ant-api03-" + "Zx9Yw8Vu7Ts6Rq5Po4Nm3Lk2Ji1Hg0Fe",
+        "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8",
+        "github_pat_" + "11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz",
+        "xoxb-" + "123456789012-1234567890123-AbCdEfGhIjKlMnOp",
+        "AKIA" + "IOSFODNN7EXAMPLE",
+        "eyJhbGciOiJIUzI1NiJ9" + ".eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
+        "0123456789abcdef0123456789abcdef01234567",  # 40 hex
+        "Q2xhdWRlVm9pY2VNb2RTZWNyZXRWYWx1ZTEyMzQ1Ng9xZ",  # random-looking base64
+    ]
+
+    def test_known_formats_redacted(self):
+        for secret in self.SECRETS:
+            out = vh.redact_secrets(f"before {secret} after")
+            self.assertNotIn(secret, out, secret)
+            self.assertIn("[REDACTED]", out, secret)
+            self.assertTrue(out.startswith("before ") and out.endswith(" after"), out)
+
+    def test_bearer_pem_assignments_connection_strings(self):
+        cases = {
+            "Authorization: Bearer abc.def-ghi_jkl123": "abc.def-ghi_jkl123",
+            "password = hunter2hunter2": "hunter2hunter2",
+            'DB_PASSWORD="p@ss w0rd"': "p@ss",
+            "api_key: 12ab34cd56": "12ab34cd56",
+            '{"client_secret": "shh-very-secret"}': "shh-very-secret",
+            "SECRET_TOKEN=abcdef": "abcdef",
+            "postgres://admin:S3cr3t!@db.example.com:5432/app": "S3cr3t!",
+            "mongodb+srv://user:pa55word@cluster0.example.net/db": "pa55word",
+            "Server=x;User Id=sa;Password=Pa55w0rd;": "Pa55w0rd",
+        }
+        for text, secret in cases.items():
+            out = vh.redact_secrets(text)
+            self.assertNotIn(secret, out, (text, out))
+            self.assertIn("[REDACTED]", out, text)
+        pem = ("-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAx1y2z3\nabc\n-----END RSA PRIVATE KEY-----")
+        out = vh.redact_secrets(f"key:\n{pem}\ndone")
+        self.assertNotIn("MIIEowIBAAKCAQEA", out)
+        self.assertIn("done", out)
+        self.assertNotIn("abc123", vh.redact_secrets("-----BEGIN PRIVATE KEY-----\nabc123 (cut off"))
+
+    def test_ordinary_text_kept(self):
+        for text in [
+            "All 12 tests passed; the build folder holds 3 files.",
+            "Edit src/components/VoicePanel.tsx and helper/voice_helper.py",
+            "max_tokens = 4096, timeout: 30",
+            "The thread id is 01a12599-7641-70d0-bae3-a91311f1ed65.",
+            "See https://example.com/docs/getting-started for details.",
+            "完了しました。テストは全部通りました。",
+            "",
+        ]:
+            self.assertEqual(vh.redact_secrets(text), text)
+
+    def test_log_redaction_includes_secrets(self):
+        self.assertNotIn("ghp_", vh.redact("token ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"))
+        self.assertIn("a=ice-pwd:[REDACTED]", vh.redact("a=ice-pwd:abcdef"))
+
+    def test_short_hash(self):
+        self.assertEqual(len(vh.short_hash("x")), 12)
+        self.assertEqual(vh.short_hash("x"), vh.short_hash("x"))
+        self.assertNotEqual(vh.short_hash("x"), vh.short_hash("y"))
+
+
+class AnswerPrivacy(unittest.TestCase):
+    def setUp(self):
+        EMITTED.clear()
+
+    def test_answer_redacted_before_realtime(self):
+        app = FakeApp()
+        app.realtime_active = True
+        app._on_handoff({"handoff_id": "h1", "input_transcript": "check the env"})
+        secret = "sk-proj-" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6"
+
+        async def run():
+            res = await app.deliver_answer("h1", f"The key is {secret}. Done.", "ok")
+            app.realtime_active = False
+            await asyncio.sleep(0.6)
+            return res
+
+        self.assertTrue(asyncio.run(run())["ok"])
+        sent = app.calls[0][1]["text"]
+        self.assertNotIn(secret, sent)
+        self.assertIn("[REDACTED]", sent)
+        self.assertIn("Done.", sent)
+
+    def test_append_bodies_not_logged(self):
+        lines = []
+
+        class Rec:
+            def write(self, kind, text):
+                lines.append((kind, text))
+
+        class Pipe:
+            def write(self, data):
+                pass
+
+            async def drain(self):
+                pass
+
+        old = vh.LOG
+        vh.LOG = Rec()
+        try:
+            app = vh.AppServer("codex.exe", {}, None, interrupt_turns=True)
+            app.proc = type("P", (), {"stdin": Pipe()})()
+            asyncio.run(app._send({"method": "thread/realtime/appendText", "id": 7,
+                                   "params": {"threadId": "T", "text": "the whole private answer"}}))
+        finally:
+            vh.LOG = old
+        self.assertEqual(len(lines), 1)
+        self.assertNotIn("private answer", lines[0][1])
+        self.assertIn("chars=24", lines[0][1])
+        self.assertIn("sha256=", lines[0][1])
+
+
+class McpDisable(unittest.TestCase):
+    def test_enabled_names_from_effective_config(self):
+        cfg = {"mcp_servers": {"a": {"enabled": False}, "b": {"command": "x"}, "c": {"enabled": True},
+                               "d.e": {}}}
+        self.assertEqual(vh.enabled_mcp_server_names(cfg), ["b", "c", "d.e"])
+        self.assertEqual(vh.enabled_mcp_server_names({}), [])
+        self.assertEqual(vh.thread_mcp_overrides(["b", "c", "d.e"]),
+                         {"mcp_servers.b.enabled": False, "mcp_servers.c.enabled": False})
+
+    def test_handshake_passes_thread_overrides(self):
+        app = FakeApp()
+
+        async def request(method, params, timeout=60):
+            app.calls.append((method, params))
+            if method == "config/read":
+                return {"config": {"mcp_servers": {"proj": {"command": "x"}, "off": {"enabled": False}}}}
+            if method == "thread/start":
+                return {"thread": {"id": "T1"}}
+            return {}
+
+        async def notify(method, params=None):
+            pass
+
+        app.request, app.notify = request, notify
+        app.check_mcp_servers = lambda: asyncio.sleep(0)
+        asyncio.run(app.handshake())
+        start = dict(app.calls)["thread/start"]
+        self.assertEqual(start["config"], {"mcp_servers.proj.enabled": False})
+
+    def test_started_server_is_reported_once(self):
+        EMITTED.clear()
+        app = FakeApp()
+        asyncio.run(app._on_notification("mcpServer/startupStatus/updated",
+                                         {"name": "clock", "status": "starting"}, "{}"))
+        asyncio.run(app._on_notification("mcpServer/startupStatus/updated",
+                                         {"name": "clock", "status": "starting"}, "{}"))
+        self.assertEqual([e for e in EMITTED if e["type"] == "mcp_warning"],
+                         [{"type": "mcp_warning", "name": "clock", "status": "starting"}])
+
+    def test_status_list_check(self):
+        EMITTED.clear()
+        app = FakeApp()
+
+        async def request(method, params, timeout=60):
+            return {"data": [{"name": "a", "runtimeStatus": "disabled"}, {"name": "b", "runtimeStatus": "connected"}]}
+
+        app.request = request
+
+        async def run():
+            real_sleep = asyncio.sleep
+            vh.asyncio.sleep = lambda s: real_sleep(0)
+            try:
+                await app.check_mcp_servers()
+            finally:
+                vh.asyncio.sleep = real_sleep
+
+        asyncio.run(run())
+        self.assertEqual([e["name"] for e in EMITTED if e["type"] == "mcp_warning"], ["b"])
+
+
+class HttpAuth(unittest.TestCase):
+    """The local HTTP server: per-run token, own Host/Origin only, no CORS."""
+
+    @classmethod
+    def setUpClass(cls):
+        import threading
+        from http.server import ThreadingHTTPServer
+
+        cls.old_token = vh.TOKEN
+        vh.TOKEN = "tok-" + "Zx9Yw8Vu7Ts6Rq5Po4Nm3Lk2Ji1Hg0Fe<&\""
+        app = FakeApp()
+        bridge = type("B", (), {})()
+        bridge.app, bridge.voice, bridge.last_activity = app, "cove", 0
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), vh.make_handler(bridge))
+        cls.server.daemon_threads = True
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        vh.TOKEN = cls.old_token
+        vh.LABEL = ""
+
+    def call(self, method, path, headers=None, body=None, host=None):
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            conn.putrequest(method, path, skip_host=True)
+            conn.putheader("Host", host or f"127.0.0.1:{self.port}")
+            data = json.dumps(body).encode() if body is not None else b""
+            if method == "POST":
+                conn.putheader("Content-Type", "application/json")
+                conn.putheader("Content-Length", str(len(data)))
+            for k, v in (headers or {}).items():
+                conn.putheader(k, v)
+            conn.endheaders(data if method == "POST" else None)
+            res = conn.getresponse()
+            payload = res.read()
+            self.assertFalse([h for h in res.getheaders() if h[0].lower().startswith("access-control")])
+            return res.status, payload
+        finally:
+            conn.close()
+
+    def test_page_is_open_and_carries_the_token(self):
+        status, page = self.call("GET", "/")
+        self.assertEqual(status, 200)
+        escaped = vh.html.escape(vh.TOKEN, quote=True)
+        self.assertIn(f'<meta name="voice-token" content="{escaped}">'.encode(), page)
+        self.assertNotIn(vh.TOKEN.encode(), page)  # only in its escaped form
+
+    def test_endpoints_need_the_token(self):
+        self.assertEqual(self.call("GET", "/health")[0], 403)
+        self.assertEqual(self.call("GET", "/events?since=0")[0], 403)
+        self.assertEqual(self.call("GET", "/health", {"X-Voice-Token": "wrong"})[0], 403)
+        self.assertEqual(self.call("POST", "/label", body={"label": "x"})[0], 403)
+        self.assertEqual(self.call("POST", "/answer", {"X-Voice-Token": "wrong"}, {"id": "1"})[0], 403)
+        self.assertEqual(self.call("POST", "/shutdown")[0], 403)
+        ok = {"X-Voice-Token": vh.TOKEN}
+        status, body = self.call("GET", "/health", ok)
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["ok"])
+        self.assertEqual(self.call("POST", "/label", ok, {"label": "docs"})[0], 200)
+
+    def test_origin_and_host_are_checked(self):
+        ok = {"X-Voice-Token": vh.TOKEN}
+        own = f"http://127.0.0.1:{self.port}"
+        self.assertEqual(self.call("GET", "/health", {**ok, "Origin": own})[0], 200)
+        self.assertEqual(self.call("GET", "/health", {**ok, "Origin": f"http://localhost:{self.port}"})[0], 200)
+        for origin in (f"http://127.0.0.1:{self.port + 1}", "http://evil.example", "null",
+                       f"https://127.0.0.1:{self.port}"):
+            self.assertEqual(self.call("GET", "/health", {**ok, "Origin": origin})[0], 403, origin)
+            self.assertEqual(self.call("POST", "/label", {**ok, "Origin": origin}, {"label": "x"})[0], 403, origin)
+        # DNS rebinding: a foreign Host name is refused, even for the page.
+        self.assertEqual(self.call("GET", "/", host=f"evil.example:{self.port}")[0], 403)
+        self.assertEqual(self.call("GET", "/health", ok, host=f"evil.example:{self.port}")[0], 403)
+        self.assertEqual(self.call("GET", "/", host=f"localhost:{self.port}")[0], 200)
+
+
 if __name__ == "__main__":
     unittest.main()

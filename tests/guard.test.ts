@@ -1,6 +1,7 @@
 // Guard rules and voice scope, as pure functions.
 import { describe, expect, test } from 'claude-code/testing'
 import { VoiceScope, checkCommand, checkVoiceToolCall } from '../hooks/guard.ts'
+import { NOTICE, isVoicePrompt, promptFor } from '../hooks/prompt.ts'
 
 const DENY_COMMANDS = [
   'rm -rf build',
@@ -171,5 +172,17 @@ describe('VoiceScope', () => {
     t.turnStarted('V1', true)
     expect(t.isVoice('seen-typed')).toBe(false) // remembered as typed
     t.turnCompleted('V1')
+  })
+})
+
+describe('isVoicePrompt', () => {
+  test('the marker is MARK at a line start plus the notice block', () => {
+    expect(isVoicePrompt(promptFor('x'))).toBe(true)
+    expect(isVoicePrompt(promptFor('x', ['y']))).toBe(true)
+    expect(isVoicePrompt('earlier queued text\n' + promptFor('x'))).toBe(true) // merged queued prompts
+    expect(isVoicePrompt('[voice] x')).toBe(false)
+    expect(isVoicePrompt(NOTICE)).toBe(false)
+    expect(isVoicePrompt('a [voice] x\n' + NOTICE)).toBe(false) // MARK not at a line start
+    expect(isVoicePrompt('git push')).toBe(false)
   })
 })

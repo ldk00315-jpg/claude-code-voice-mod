@@ -2,9 +2,11 @@
 // The test's hooks stand in for the engine (a fake helper child, the prompt queue, HTTP, tools).
 import { expect, mock, test } from 'claude-code/testing'
 import type { HttpInit, On } from 'claude-code'
+import { promptFor } from '../hooks/prompt.ts'
 
 const TYPED = { origin: { kind: 'composer' as const }, presentation: { isFullscreen: false, columns: 120 } }
-const READY = '{"type":"ready","port":4321,"pid":1}\n'
+const TOKEN = 'test-token-0123456789abcdefghijklmnopqrstuv'
+const READY = `{"type":"ready","port":4321,"pid":1,"token":"${TOKEN}"}\n`
 const req = (id: string, text: string) => JSON.stringify({ type: 'request', id, text, userSaid: [] }) + '\n'
 const DONE = { durationMs: 1, isAborted: false, reason: 'answer' as const }
 
@@ -110,6 +112,7 @@ test('requests run one at a time; answers go back; the guard covers voice turns 
   expect(eng.posts.length).toBe(1)
   expect(eng.posts[0]?.url).toBe('http://127.0.0.1:4321/answer')
   expect(bodyOf(eng.posts, 0)).toMatchObject({ id: 'r1', answer: 'There are two folders: helper and hooks.', status: 'ok', turnId: 'V1' })
+  expect(eng.posts[0]?.init?.headers?.['X-Voice-Token']).toBe(TOKEN) // the helper refuses calls without it
 
   // r2 is submitted next.
   await eng.nextSubmit(2)
@@ -138,6 +141,7 @@ test('requests run one at a time; answers go back; the guard covers voice turns 
   const off = await $.command.run({ command: 'voice', args: 'off', ...TYPED })
   expect(off.text).toBe('voice: stopped')
   expect(eng.posts[2]?.url).toBe('http://127.0.0.1:4321/shutdown')
+  expect(eng.posts[2]?.init?.headers?.['X-Voice-Token']).toBe(TOKEN)
   eng.release()
 })
 
@@ -160,4 +164,63 @@ test('a request that takes too long is answered "timeout", and the late answer s
 
   await $.command.run({ command: 'voice', args: 'off', ...TYPED })
   eng.release()
+})
+
+test('a voice prompt whose job timed out before its turn started is still guarded', async ($, on) => {
+  const clock = mock.clock(on)
+  const eng = engine(on, READY + req('r1', 'clean up the build folder'))
+  await $.command.run({ command: 'voice', args: 'on', ...TYPED })
+  await eng.nextSubmit(1)
+  // The session is busy with a long typed turn; the voice prompt waits in Claude Code's queue.
+  await clock.advance(10 * 60 * 1000 + 1)
+  expect(bodyOf(eng.posts, 0)).toMatchObject({ id: 'r1', status: 'timeout' })
+
+  await $.turn.start({ text: eng.submitted[0] ?? '', turnId: 'V1' })
+  expect(outcome(await $.tool.call({ tool: 'Bash', command: 'git push origin main' }))).toContain('came in by voice')
+  const sub = await $.tool.call({ tool: 'Bash', command: 'rm -rf build', agentId: 'sub-1' } as never)
+  expect(outcome(sub)).toContain('came in by voice') // its subagents too
+  await $.turn.complete({ ...DONE, answer: 'Cleaned.', turnId: 'V1' })
+  expect(bodyOf(eng.posts, 1)).toMatchObject({ id: 'r1', status: 'late', answer: 'Cleaned.' }) // helper still running
+
+  // A typed turn afterwards is not guarded.
+  await $.turn.start({ text: 'git push please', turnId: 'U1' })
+  expect(outcome(await $.tool.call({ tool: 'Bash', command: 'git push origin main' }))).toBe('reached core')
+  await $.turn.complete({ ...DONE, answer: 'ok', turnId: 'U1' })
+
+  await $.command.run({ command: 'voice', args: 'off', ...TYPED })
+  eng.release()
+})
+
+test('a voice prompt still queued after /voice off is guarded; its answer is dropped', async ($, on) => {
+  const eng = engine(on, READY + req('r1', 'delete the old logs'))
+  await $.command.run({ command: 'voice', args: 'on', ...TYPED })
+  await eng.nextSubmit(1)
+  const off = await $.command.run({ command: 'voice', args: 'off', ...TYPED })
+  expect(off.text).toBe('voice: stopped')
+  const before = eng.posts.length // the /shutdown call
+
+  await $.turn.start({ text: eng.submitted[0] ?? '', turnId: 'V1' })
+  expect(outcome(await $.tool.call({ tool: 'Bash', command: 'git push' }))).toContain('came in by voice')
+  const sub = await $.tool.call({ tool: 'PowerShell', command: 'Remove-Item -Recurse logs', agentId: 'sub-2' } as never)
+  expect(outcome(sub)).toContain('came in by voice')
+  expect(outcome(await $.tool.call({ tool: 'Bash', command: 'ls' }))).toBe('reached core')
+  await $.turn.complete({ ...DONE, answer: 'Deleted.', turnId: 'V1' })
+  expect(eng.posts.length).toBe(before) // helper stopped: nothing posted
+
+  await $.turn.start({ text: 'rm -rf build', turnId: 'U1' })
+  expect(outcome(await $.tool.call({ tool: 'Bash', command: 'rm -rf build' }))).toBe('reached core')
+  await $.turn.complete({ ...DONE, answer: 'ok', turnId: 'U1' })
+  eng.release()
+})
+
+test('the voice marker alone marks a turn as voice (fail-safe), and only the full marker', async ($, on) => {
+  engine(on, READY)
+  // Not submitted by this module run (e.g. after a reload): the marker is enough.
+  await $.turn.start({ text: promptFor('push the branch'), turnId: 'V1' })
+  expect(outcome(await $.tool.call({ tool: 'Bash', command: 'git push' }))).toContain('came in by voice')
+  await $.turn.complete({ ...DONE, answer: 'no', turnId: 'V1' })
+  // "[voice] " without the notice block is an ordinary typed prompt.
+  await $.turn.start({ text: '[voice] push the branch', turnId: 'U1' })
+  expect(outcome(await $.tool.call({ tool: 'Bash', command: 'git push' }))).toBe('reached core')
+  await $.turn.complete({ ...DONE, answer: 'ok', turnId: 'U1' })
 })

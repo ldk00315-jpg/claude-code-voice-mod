@@ -26,7 +26,9 @@ Claude Code session. When Claude finishes, the voice reads you a one or two sent
 > - **Data sent to OpenAI.** Your microphone audio, its transcripts, the requests handed to Claude,
 >   and **Claude's answers (trimmed to about 2000 characters, code blocks removed)** are sent to
 >   OpenAI so the voice can summarise them. Anything in those answers, including file contents or
->   paths Claude mentions, leaves your machine.
+>   paths Claude mentions, leaves your machine. Secret-looking strings (API keys, tokens, JWTs,
+>   private keys, `password = ...` lines, credentials in connection strings, long random strings)
+>   are replaced by `[REDACTED]` first, but this is **best effort**: it only knows common formats.
 > - **Voice can misfire.** Background speech, a TV, or a misheard phrase can become a request to
 >   Claude. Voice requests run **with the same permissions as your Claude Code session**.
 > - **The guard is not a sandbox.** Dangerous actions in voice-originated turns are blocked by a
@@ -75,9 +77,17 @@ Claude Code session. When Claude finishes, the voice reads you a one or two sent
   needs the computer). A delegation arrives as a `handoff_request`; codex is told to do nothing and
   its turn is interrupted at once, so **Claude Code is the only worker**.
 - codex is started with `read-only` sandbox, `approval_policy="never"`, web search off, your
-  configured MCP servers disabled (`-c mcp_servers.<name>.enabled=false`, read from
-  `~/.codex/config.toml` without modifying it) and features such as apps, plugins, computer use and
-  browser use disabled. Any approval request from codex is declined.
+  configured MCP servers disabled and features such as apps, plugins, computer use and browser use
+  disabled. MCP servers are turned off per name, twice: `-c mcp_servers.<name>.enabled=false` for
+  the servers in `config.toml` (`%CODEX_HOME%` or `~/.codex`, read only, never modified), then a
+  thread-level override for every server the effective config (`config/read`, all layers) still
+  has enabled. codex merges `-c` tables, so one override cannot empty the whole list. If an MCP
+  server still starts, the helper logs a WARN and prints an `mcp_warning` line. Any approval
+  request from codex is declined.
+- The local HTTP server accepts only `Host`/`Origin` of its own `127.0.0.1:<port>` and needs a
+  random per-run token (`X-Voice-Token`) on every call except loading the page; the token is in
+  the helper's `ready` line for the plugin and embedded in the page it serves. No CORS headers are
+  sent, so other web pages cannot read it.
 - More detail: [docs/how-it-works.md](docs/how-it-works.md).
 
 ## Requirements
@@ -161,7 +171,10 @@ The helper keeps its data **outside the plugin folder**, in a per-user folder:
 - `%LOCALAPPDATA%\claude-code-voice-mod\` by default, or the folder in the environment variable
   `VOICE_MOD_DATA_DIR`.
 - `settings.json` (voice and persona), `logs\voice-*.log`, `logs\voice-answers.jsonl` (metadata
-  only, no answer text) and an empty `codex-cwd\` folder used as codex's working directory.
+  only: id, status, length and a short hash, no answer text) and an empty `codex-cwd\` folder
+  used as codex's working directory.
+- The log never holds answer bodies (only id, length and a short hash). Transcripts and requests
+  are kept for debugging, with secret-looking strings redacted (best effort).
 
 By default the assistant is a **neutral, friendly voice assistant that answers in the language you
 speak** (for example Japanese or English). To give it a character, add a `persona` section to
@@ -222,6 +235,10 @@ Limits:
   inside scripts (`python cleanup.py` that deletes files is not stopped), and it errs on the safe
   side for text that merely contains a dangerous phrase (`echo "rm -rf"` is blocked).
 - Reading and editing files is allowed. A misheard request can still change files.
+- A turn counts as voice-originated when its prompt carries the voice marker (a line starting
+  with `[voice] ` plus the plugin's notice block), or is a text the plugin submitted, whatever
+  happened to the request meanwhile (timed out, `/voice off`). A typed prompt that contains the
+  whole marker (for example a pasted voice prompt) is guarded too: fail-safe by design.
 - The guard's state lives in the module: if the plugin hot-reloads during a voice turn, tracking of
   that turn is lost (new voice turns are tracked normally).
 - It is a seat belt, not a sandbox. Do not rely on it for security.
@@ -241,7 +258,7 @@ Limits:
 | The voice interrupts itself | Use a headset (echo). |
 | The voice answers by itself instead of delegating | Ask more concretely ("look at the files in..."); adjust `persona.instructions`. |
 | Answer not spoken | The status line says why (`answer not spoken: ...`); the page log shows `Result -> speech`. |
-| Anything else | `%LOCALAPPDATA%\claude-code-voice-mod\logs\voice-*.log` (SDP credentials and tokens are redacted, but transcripts and requests are in it: review before sharing). |
+| Anything else | `%LOCALAPPDATA%\claude-code-voice-mod\logs\voice-*.log` (SDP credentials and secret-looking strings are redacted and answers are not logged, but transcripts and requests are in it: review before sharing). |
 
 ## Development
 

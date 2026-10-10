@@ -15,7 +15,7 @@
 // scheduled tasks and sending/deleting MCP tools (hooks/guard.ts). Typed turns are untouched.
 import type { EngineInterface, HookStream, ProcessSpawnChunk, ProcessSpawnResult, Register } from 'claude-code'
 import { VoiceScope, checkVoiceToolCall, denyMessage } from './guard.ts'
-import { MARK, promptFor } from './prompt.ts'
+import { MARK, isVoicePrompt, promptFor } from './prompt.ts'
 
 const NAME = 'voice'
 
@@ -69,9 +69,14 @@ type Job = {
 // Module variables: a reload unloads the module, which also kills the child.
 let child: HookStream<ProcessSpawnChunk, ProcessSpawnResult> | null = null
 let port = 0
+let token = '' // per-run secret from the helper's ready line; sent as X-Voice-Token
 let phase = 'stopped'
 let jobs: Job[] = []
 const scope = new VoiceScope()
+// Every prompt text this module submitted. Never cleared while the module is loaded (a reload
+// starts it over): a second signal, besides the marker, that a starting turn is a voice turn,
+// even after its job timed out or `/voice off` dropped the queue.
+const submittedTexts = new Set<string>()
 
 function show($: EngineInterface, next: string) {
   phase = next
@@ -94,7 +99,7 @@ async function postAnswer($: EngineInterface, job: Job, answer: string, status: 
   try {
     const res = await $.http.fetch(`http://127.0.0.1:${port}/answer`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-Voice-Token': token },
       body,
     })
     if (!res.ok) show($, `answer not spoken (HTTP ${res.status}: voice page closed?)`)
@@ -117,6 +122,7 @@ function pump($: EngineInterface) {
     show($, `timed out ${job.id}`)
     pump($)
   })
+  submittedTexts.add(job.text)
   // Resolves when its turn starts (the session may be busy with a typed turn first).
   void $.prompt.submit({ text: job.text }).catch(err => {
     job.state = 'done'
@@ -127,7 +133,7 @@ function pump($: EngineInterface) {
 }
 
 async function onLine($: EngineInterface, line: string) {
-  let msg: { type?: string; port?: number; id?: string; text?: string; userSaid?: unknown; state?: string; role?: string; via?: string; error?: string; label?: string }
+  let msg: { type?: string; port?: number; id?: string; text?: string; userSaid?: unknown; state?: string; role?: string; via?: string; error?: string; label?: string; token?: string }
   try {
     msg = JSON.parse(line)
   } catch {
@@ -138,6 +144,7 @@ async function onLine($: EngineInterface, line: string) {
     case 'ready':
       if (typeof msg.port === 'number') {
         port = msg.port
+        token = typeof msg.token === 'string' ? msg.token : ''
         show($, 'helper ready: press Start on the voice page')
       }
       break
@@ -211,6 +218,7 @@ function start($: EngineInterface, label: string) {
     if (child === stream) {
       child = null
       port = 0
+      token = ''
       resetJobs()
       show($, 'stopped')
       $.ui.toast(`voice: ${ended}`)
@@ -223,13 +231,14 @@ async function stopHelper($: EngineInterface) {
   if (!stream) return
   if (port) {
     try {
-      await $.http.fetch(`http://127.0.0.1:${port}/shutdown`, { method: 'POST' })
+      await $.http.fetch(`http://127.0.0.1:${port}/shutdown`, { method: 'POST', headers: { 'X-Voice-Token': token } })
     } catch {
       // fall through to killing it
     }
   }
   child = null
   port = 0
+  token = ''
   resetJobs()
   show($, 'stopped')
   // Ending the stream kills the child if it is still alive; not awaited (a pending read
@@ -276,13 +285,19 @@ export const register: Register = on => {
   // Correlation: a plugin's own hooks do not see its own $.prompt.submit, so the
   // voice turn is recognised at turn.start by its text containing the submitted prompt.
   // turn.start fires for the main loop only (a subagent's run raises none).
+  // Whether the turn is guarded does not depend on the job queue: the voice marker
+  // (prompt.ts isVoicePrompt) or any text this module ever submitted is enough, so a voice
+  // prompt still queued in Claude Code after a timeout or `/voice off` runs guarded.
   on('turn.start', async ($, e, next) => {
-    const job = jobs.find(j => j.state === 'submitted' && e.text.includes(j.text))
+    const job = jobs.find(
+      j => (j.state === 'submitted' || (j.state === 'abandoned' && !j.turnId)) && e.text.includes(j.text),
+    )
     if (job) {
-      job.state = 'running'
-      job.turnId = e.turnId
+      if (job.state === 'submitted') job.state = 'running'
+      job.turnId = e.turnId // an abandoned job keeps its state: its answer is posted as "late"
     }
-    scope.turnStarted(e.turnId, job !== undefined)
+    const voice = job !== undefined || isVoicePrompt(e.text) || [...submittedTexts].some(t => e.text.includes(t))
+    scope.turnStarted(e.turnId, voice)
     return next(e)
   })
 

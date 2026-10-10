@@ -38,12 +38,21 @@ depend on them except for waiting on `session.started` before a preview.
 
 - Started as `codex app-server -c sandbox_mode="read-only" -c approval_policy="never"
   -c web_search="disabled" -c model_reasoning_effort="low" -c notify=[]` plus
-  `-c mcp_servers.<name>.enabled=false` for every MCP server in `~/.codex/config.toml` (read, never
-  written; an override for a name that is not configured would be rejected by codex), and
+  `-c mcp_servers.<name>.enabled=false` for every MCP server in `config.toml` under `CODEX_HOME`
+  (default `~/.codex`; read, never written; an override for a name that is not configured would be
+  rejected by codex), and
   `--disable hooks multi_agent apps plugins computer_use browser_use in_app_browser
   image_generation memories js_repl goals`.
 - `thread/start`: read-only sandbox, `approvalPolicy: "never"`, `ephemeral: true`, an empty working
   folder, and developer instructions that say "do nothing, reply OK".
+- MCP servers: codex merges `-c` tables into the user's config (codex-rs `config/src/merge.rs`,
+  rust-v0.160.0), so `-c mcp_servers={}` cannot replace the table, and there is no switch for all
+  servers at once. The helper therefore reads the effective config with `config/read` (system, user,
+  profile and project layers) and passes `config: {"mcp_servers.<name>.enabled": false}` in
+  `thread/start` for every server still enabled. App and plugin servers are off through
+  `--disable apps plugins`. After `thread/start` it checks `mcpServerStatus/list`, and any
+  `mcpServer/startupStatus/updated` notification (a server starting anyway) is logged as a WARN and
+  printed as `{"type":"mcp_warning","name":...,"status":...}`.
 - `thread/realtime/start`: `includeStartupContext: false` (no workspace context for the voice model),
   `clientManagedHandoffs: true` (codex does not feed its own output to the voice model), and the
   helper's own `prompt` (it replaces codex's default backend prompt, so it must say when to delegate).
@@ -65,7 +74,12 @@ depend on them except for waiting on `session.started` before a preview.
    (a session runs one turn at a time anyway).
 3. A plugin's own hooks do not see its own `$.prompt.submit`, so the voice turn is recognised at
    `turn.start` by its text containing the submitted prompt; its `turnId` is recorded. Only the
-   main-loop `turn.complete` of that turn (no `agentId`) counts as the answer.
+   main-loop `turn.complete` of that turn (no `agentId`) counts as the answer. Whether the turn is
+   guarded does not depend on the queue: the voice marker (`[voice] ` at a line start plus the
+   notice block, `hooks/prompt.ts`) or any text the plugin ever submitted (kept until the module
+   unloads) is enough. So a voice prompt still queued in Claude Code after its request timed out or
+   after `/voice off` runs guarded; its answer is posted as `late` if the helper still runs, else
+   dropped. A typed prompt containing the whole marker is guarded too (fail-safe).
 4. The plugin posts `{id, answer, status, reason, turnId, durationMs}` to the helper's
    `POST /answer`. `status` is `ok`, `aborted`, `error`, `refusal`, `timeout` (10 minutes) or `late`.
 5. codex 0.160.0 has **no client call that completes a specific handoff with a result**: with
@@ -97,11 +111,23 @@ The label goes into the page title and heading and into the voice prompt.
 ## Data and privacy
 
 - Sent to OpenAI: microphone audio, transcripts, request texts, and Claude's trimmed answers.
-- Local logs (in the data folder) contain transcripts and request texts; SDP ICE credentials,
-  fingerprints, candidate IPs, bearer tokens, JWTs and API-key-like strings are redacted.
-  `voice-answers.jsonl` records only id, status, length and turn id, never the answer text.
-- The helper's HTTP server listens on `127.0.0.1` only and refuses POSTs whose `Origin` is not
-  `http://127.0.0.1:*` or `http://localhost:*`.
+- Before an answer goes to the realtime model, secret-looking strings are replaced by `[REDACTED]`
+  (`redact_secrets` in the helper): API keys (`sk-...`, `ghp_...`, `github_pat_...`, `xox?-...`,
+  `AKIA...`, ...), JWTs, `Bearer`/`Basic` credentials, PEM private keys, `password|secret|token|
+  api_key ... = value` assignments, credentials in URLs and connection strings, and long hex or
+  random base64 strings (32+ characters). This is best effort: unusual formats get through, and
+  harmless long ids such as commit hashes may be hidden.
+- Local logs (in the data folder) contain transcripts and request texts, passed through the same
+  redaction plus SDP ICE credentials, fingerprints and candidate IPs. Answer bodies are never
+  logged: the log line for an `appendText`/`appendSpeech` holds only its length and a short SHA-256
+  prefix, and `voice-answers.jsonl` records only id, status, length, that hash and turn id.
+- The helper's HTTP server listens on `127.0.0.1` only. Every request must carry `Host`
+  `127.0.0.1:<port>` or `localhost:<port>` (no DNS rebinding); an `Origin`, when present, must be
+  exactly `http://127.0.0.1:<port>` or `http://localhost:<port>`; and every path except `GET /`
+  (and `/favicon.ico`) needs `X-Voice-Token`, a random per-run token (`secrets.token_urlsafe(32)`,
+  compared in constant time). The plugin gets it from the `ready` line; the page gets it embedded
+  in a `<meta>` tag by `GET /`. No CORS headers are sent, so a page of another origin cannot read
+  that response. Refusals are `403`.
 
 ## Known limits
 

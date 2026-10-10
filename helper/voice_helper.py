@@ -10,7 +10,7 @@
     WebRTC media flows page <-> OpenAI directly; codex keeps a sideband control socket.
 
 stdout protocol (one JSON object per line, read by the Claude Code plugin):
-  {"type":"ready","port":N,"pid":P,"url":..,"threadId":..}
+  {"type":"ready","port":N,"pid":P,"url":..,"threadId":..,"token":..}   token: per-run secret for HTTP
   {"type":"realtime","state":"connecting|started|connected|media-connected|media-failed|closed|error",...}
   {"type":"voice","event":"selected|active","voice":..,"source"|"purpose":..}  chosen / in-use voice
   {"type":"transcript","role":"user|assistant","text":..}       final text of one utterance
@@ -23,9 +23,14 @@ stdout protocol (one JSON object per line, read by the Claude Code plugin):
   {"type":"answer_delivered","id":..,"status":..,"chars":N,"via":"appendText|appendSpeech"}
   {"type":"answer_undelivered","id":..,"error":..}                realtime not running, etc.
   {"type":"ack","id":..}                                          POST /answer received
+  {"type":"mcp_warning","name":..,"status":..}                  an MCP server started despite being disabled
   {"type":"heartbeat"} / {"type":"bye","reason":..}
 
-HTTP (127.0.0.1 only):
+HTTP (127.0.0.1 only). Every request must carry Host 127.0.0.1:<port> or localhost:<port>, and an
+Origin, when sent, must be exactly http://127.0.0.1:<port> or http://localhost:<port>. Every path but
+GET / (and /favicon.ico) needs the header X-Voice-Token: <token from the ready line>; the page gets
+the token embedded by GET /. No CORS headers are ever sent, so other web pages cannot read it.
+Anything refused gets 403.
   GET  /              the voice page        GET /health  {"ok":true,...}
   GET  /events?since=N   recent events for the page
   GET  /voices    voice list (listVoices, static fallback) + selected/active voice
@@ -54,10 +59,13 @@ Handoff self test (text that should be handed off, then a fake answer is fed bac
 import argparse
 import asyncio
 import ctypes
+import hashlib
+import hmac
 import html
 import json
 import os
 import re
+import secrets
 import shutil
 import signal
 import subprocess
@@ -208,6 +216,17 @@ def realtime_prompt():
     return build_realtime_prompt(PERSONA, LABEL)
 
 
+# Per-run secret (set in amain): required as X-Voice-Token on every HTTP call but GET /.
+TOKEN = ""
+
+
+def page_with_token(page: bytes, token: str) -> bytes:
+    """The voice page with the per-run token in its <meta name="voice-token">."""
+    value = html.escape(token, quote=True).encode("utf-8")
+    return page.replace(b'<meta name="voice-token" content="">',
+                        b'<meta name="voice-token" content="' + value + b'">', 1)
+
+
 def page_with_label(page):
     """The voice page with the thread name in front of its title and heading."""
     if not LABEL:
@@ -234,7 +253,8 @@ CODEX_OVERRIDES = [
 # server, "plugins" = plugin-provided MCP servers/skills (cua_repl etc.). realtime is not touched.
 CODEX_DISABLED_FEATURES = ["hooks", "multi_agent", "apps", "plugins", "computer_use", "browser_use",
                            "in_app_browser", "image_generation", "memories", "js_repl", "goals"]
-CODEX_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".codex", "config.toml")  # read only
+CODEX_HOME = os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
+CODEX_CONFIG_PATH = os.path.join(CODEX_HOME, "config.toml")  # read only, never written
 
 ANSWER_MAX_CHARS = 2000  # what is sent to the realtime model (it summarises it to 1-2 sentences)
 ANSWER_SPOKEN_CHECK_SECONDS = 12  # no assistant transcript by then -> one retry via appendSpeech
@@ -242,12 +262,70 @@ ANSWER_SPOKEN_CHECK_SECONDS = 12  # no assistant transcript by then -> one retry
 
 # ---------------------------------------------------------------- logging / stdout
 
+# Secret-looking strings, replaced by [REDACTED] in Claude's answers before they go to the realtime
+# model (OpenAI), and in everything written to the log. Best effort: it catches common formats,
+# not every secret, and may also hide harmless long ids (commit hashes, for example).
+# Names whose value is a secret in "name = value" / "name: value" (config files, env, JSON).
+_SECRET_NAMES = (r"password|passwd|pwd|secret|token|api[_\-]?key|access[_\-]?key|private[_\-]?key|"
+                 r"client[_\-]?secret|authorization|credentials?")
+_SECRET_RULES = [
+    # PEM private keys: the whole block (or up to the end of the text when it is cut off)
+    (re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\Z)", re.S),
+     "[REDACTED]"),
+    # credentials in URLs and connection strings: scheme://user:password@host
+    (re.compile(r"\b([A-Za-z][A-Za-z0-9+.\-]*://)[^\s/:@\"'<>]+:[^\s/@\"'<>]+@"), r"\1[REDACTED]@"),
+    # Authorization: Bearer ... / Basic ...
+    (re.compile(r"(?i)\b(bearer|basic)(\s+)[A-Za-z0-9\-._~+/]{8,}=*"), r"\1\2[REDACTED]"),
+    # JSON Web Tokens
+    (re.compile(r"\beyJ[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}"), "[REDACTED]"),
+    # well-known key formats
+    (re.compile(r"\b(?:sk|rk|pk)-(?:[A-Za-z0-9]+-)*[A-Za-z0-9_\-]{16,}"), "[REDACTED]"),  # sk-..., sk-proj-...
+    (re.compile(r"\b(?:sk|rk|pk|whsec)_(?:live_|test_)?[A-Za-z0-9]{16,}"), "[REDACTED]"),
+    (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"), "[REDACTED]"),  # GitHub tokens
+    (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"), "[REDACTED]"),
+    (re.compile(r"\bglpat-[A-Za-z0-9_\-]{20,}"), "[REDACTED]"),  # GitLab
+    (re.compile(r"\bxox[a-z]-[A-Za-z0-9\-]{10,}"), "[REDACTED]"),  # Slack
+    (re.compile(r"\b(?:AKIA|ASIA|AGPA|AIDA|AROA|ANPA)[0-9A-Z]{16}\b"), "[REDACTED]"),  # AWS key ids
+    (re.compile(r"\bAIza[0-9A-Za-z_\-]{35}"), "[REDACTED]"),  # Google API keys
+    (re.compile(r"\b(?:npm|hf)_[A-Za-z0-9]{30,}"), "[REDACTED]"),
+    # name = value / name: value assignments (password, secret, token, api_key, ...): a quoted value
+    # whole, else up to a space or separator; small numbers (max_tokens = 4096) are left alone
+    (re.compile(r"(?i)(\b[\w.\-]*(?:" + _SECRET_NAMES + r")[\w.\-]*\b[\"']?\s*[:=]\s*)([\"'])(?!\[REDACTED\])"
+                r"[^\"'\n]{3,}?\2"), r"\1\2[REDACTED]\2"),
+    (re.compile(r"(?i)(\b[\w.\-]*(?:" + _SECRET_NAMES + r")[\w.\-]*\b[\"']?\s*[:=]\s*[\"']?)"
+                r"(?!\[REDACTED\])(?!\d{1,6}\b)[^\s\"',;}]{3,}"), r"\1[REDACTED]"),
+    (re.compile(r"((?:パスワード|暗証番号)\s*[:：=]\s*)\S+"), r"\1[REDACTED]"),
+    # long hex strings (32+), e.g. API secrets, hashes
+    (re.compile(r"(?<![0-9A-Za-z])[0-9a-fA-F]{32,}(?![0-9A-Za-z])"), "[REDACTED]"),
+]
+_LONG_TOKEN = re.compile(r"(?<![A-Za-z0-9+/_\-])[A-Za-z0-9+/_\-]{32,}={0,2}(?![A-Za-z0-9+/=_\-])")
+
+
+def _long_token(m: re.Match) -> str:
+    """A 32+ character base64/base64url run that looks random (digits, upper and lower case, many
+    different characters): a secret. Words, paths and ordinary identifiers are kept."""
+    s = m.group(0)
+    if (any(c.isdigit() for c in s) and any(c.isupper() for c in s) and any(c.islower() for c in s)
+            and len(set(s)) >= 16):
+        return "[REDACTED]"
+    return s
+
+
+def redact_secrets(text: str) -> str:
+    """Replaces secret-looking strings with [REDACTED] (best effort, see _SECRET_RULES)."""
+    if not text:
+        return text
+    for pattern, repl in _SECRET_RULES:
+        text = pattern.sub(repl, text)
+    return _LONG_TOKEN.sub(_long_token, text)
+
+
+def short_hash(text: str) -> str:
+    """First 12 hex digits of the text's SHA-256: lets logs tell answers apart without their text."""
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:12]
+
+
 _SECRET_PATTERNS = [
-    (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._\-]+"), r"\1[REDACTED]"),
-    (re.compile(r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]+"), "[JWT-REDACTED]"),
-    (re.compile(r"sk-[A-Za-z0-9_\-]{16,}"), "[KEY-REDACTED]"),
-    (re.compile(r'(?i)("?(?:access_token|refresh_token|id_token|api_key|authorization)"?\s*[:=]\s*"?)[^",\s}]+'),
-     r"\1[REDACTED]"),
     # SDP lines (also when the SDP sits inside JSON with escaped \r\n, hence the excluded backslash)
     (re.compile(r"(a=ice-pwd:)[^\s\\]+"), r"\1[REDACTED]"),
     (re.compile(r"(a=ice-ufrag:)[^\s\\]+"), r"\1[REDACTED]"),
@@ -258,9 +336,10 @@ _SECRET_PATTERNS = [
 
 
 def redact(text: str) -> str:
+    """What the log gets: SDP credentials and addresses out, then secret-looking strings."""
     for pattern, repl in _SECRET_PATTERNS:
         text = pattern.sub(repl, text)
-    return text
+    return redact_secrets(text)
 
 
 def _strip_sdp(obj):
@@ -323,11 +402,12 @@ def emit(obj: dict):
     """One JSON line to stdout (+ log + page event buffer). A broken pipe means the parent is gone."""
     global _seq
     line = json.dumps(obj, ensure_ascii=False)
-    LOG.write("OUT", line)
+    public = {k: v for k, v in obj.items() if k != "token"}  # the token goes to stdout (the Mod) only
+    LOG.write("OUT", json.dumps(public, ensure_ascii=False) if "token" in obj else line)
     with _out_lock:
         _seq += 1
         if obj.get("type") != "heartbeat":
-            _events.append((_seq, obj))
+            _events.append((_seq, public))
         try:
             sys.stdout.buffer.write((line + "\n").encode("utf-8"))
             sys.stdout.buffer.flush()
@@ -395,6 +475,28 @@ def mcp_disable_overrides(names: list[str]) -> list[str]:
             out.append(f"mcp_servers.{name}.enabled=false")
         else:
             LOG.write("WARN", f"MCP server name {name!r} not overridable from the CLI; left as is")
+    return out
+
+
+def enabled_mcp_server_names(config: dict) -> list[str]:
+    """Servers that `config/read` (the effective config, every layer: system, user, profile, project)
+    reports as not disabled."""
+    servers = config.get("mcp_servers") if isinstance(config, dict) else None
+    if not isinstance(servers, dict):
+        return []
+    return sorted(name for name, server in servers.items()
+                  if not (isinstance(server, dict) and server.get("enabled") is False))
+
+
+def thread_mcp_overrides(names: list[str]) -> dict:
+    """thread/start `config` overrides that disable each named server for the helper's thread
+    (dotted keys, like -c). A name with a dot cannot be addressed this way and is reported."""
+    out = {}
+    for name in names:
+        if "." in name or not name:
+            LOG.write("WARN", f"MCP server name {name!r} cannot be disabled by a thread override")
+        else:
+            out[f"mcp_servers.{name}.enabled"] = False
     return out
 
 
@@ -547,6 +649,7 @@ class AppServer:
         self.recent_user: deque = deque(maxlen=4)  # last final user utterances (context for requests)
         self.assistant_seq = 0  # bumps on each final assistant transcript
         self.emit_requests = True
+        self.mcp_warned: set = set()  # (name, status) already reported
 
     async def start(self):
         args = [self.exe, "app-server"]
@@ -570,7 +673,11 @@ class AppServer:
     # -- wire
     async def _send(self, obj: dict):
         data = json.dumps(obj, ensure_ascii=False)
-        LOG.write("RPC>", loggable(data))
+        if obj.get("method") in ("thread/realtime/appendText", "thread/realtime/appendSpeech"):
+            text = str((obj.get("params") or {}).get("text") or "")  # an answer or typed text: no body
+            LOG.write("RPC>", f"{obj['method']} id={obj.get('id')} chars={len(text)} sha256={short_hash(text)}")
+        else:
+            LOG.write("RPC>", loggable(data))
         self.proc.stdin.write((data + "\n").encode("utf-8"))
         await self.proc.stdin.drain()
 
@@ -670,7 +777,9 @@ class AppServer:
         if not quiet:
             LOG.write("RPC<", loggable(raw))
 
-        if method == "thread/realtime/started":
+        if method == "mcpServer/startupStatus/updated":
+            self._on_mcp_status(str(p.get("name") or "?"), str(p.get("status") or "?"))
+        elif method == "thread/realtime/started":
             self.realtime_active = True
             emit({"type": "realtime", "state": "started", "version": p.get("version"),
                   "realtimeSessionId": p.get("realtimeSessionId")})
@@ -737,6 +846,14 @@ class AppServer:
             elif item.get("type") not in ("reasoning",):
                 emit({"type": "codex_item", "itemType": item.get("type"), "turnId": p.get("turnId")})
 
+    def _on_mcp_status(self, name: str, status: str):
+        """Every MCP server is disabled for this app-server; one that still starts is reported."""
+        if (name, status) in self.mcp_warned:
+            return
+        self.mcp_warned.add((name, status))
+        LOG.write("WARN", f"MCP server {name!r} {status} although MCP servers are disabled for the voice helper")
+        emit({"type": "mcp_warning", "name": name, "status": status})
+
     def _on_handoff(self, item: dict):
         """One handoff_request (bespoke_event_handling.rs) -> one stdout "request" line.
         v3 (Frameless Bidi) fills input_transcript with the delegation's input_text (the realtime
@@ -773,7 +890,8 @@ class AppServer:
         if not self.realtime_active:
             emit({"type": "answer_undelivered", "id": rid, "error": "realtime not running"})
             return {"ok": False, "error": "realtime not running"}
-        msg = answer_message(status, req["text"], answer)
+        # Claude's answer goes to the realtime model (OpenAI): secret-looking strings out first.
+        msg = answer_message(status, req["text"], redact_secrets(answer))
         late = req["answered"]
         req["answered"] = True
         seq = self.assistant_seq
@@ -814,19 +932,55 @@ class AppServer:
         }, timeout=60)
         await self.notify("initialized")
         LOG.write("INFO", f"initialized userAgent={(init or {}).get('userAgent')}")
-        res = await self.request("thread/start", {
+        params = {
             "cwd": CODEX_CWD,
             "sandbox": "read-only",
             "approvalPolicy": "never",
             "ephemeral": True,
             "developerInstructions": CODEX_DEVELOPER_INSTRUCTIONS,
             "serviceName": "claude_voice_mod",
-        }, timeout=90)
+        }
+        overrides = await self.mcp_thread_overrides()
+        if overrides:
+            params["config"] = overrides
+        res = await self.request("thread/start", params, timeout=90)
         self.thread_id = res["thread"]["id"]
+        asyncio.create_task(self.check_mcp_servers())
         LOG.write("INFO", f"thread {self.thread_id} model={res.get('model')} provider={res.get('modelProvider')} "
                           f"approval={res.get('approvalPolicy')} sandbox={json.dumps(res.get('sandbox'))}")
         await self.list_voices()
         return res
+
+    async def mcp_thread_overrides(self) -> dict:
+        """No MCP server may run for the helper. The -c overrides at spawn cover the servers in
+        config.toml, and --disable apps/plugins the app and plugin ones; codex merges -c tables
+        (rust-v0.160.0 config/src/merge.rs), so `mcp_servers={}` cannot empty the table. Any server
+        the effective config (config/read: system, user, profile and project layers) still has
+        enabled is disabled for the thread through thread/start `config`."""
+        try:
+            res = await self.request("config/read", {"cwd": CODEX_CWD}, timeout=30)
+        except Exception as e:
+            LOG.write("WARN", f"config/read failed ({e}); relying on the -c overrides only")
+            return {}
+        names = enabled_mcp_server_names((res or {}).get("config") or {})
+        LOG.write("INFO", f"MCP servers still enabled after the -c overrides: {names}")
+        return thread_mcp_overrides(names)
+
+    async def check_mcp_servers(self):
+        """After thread/start: reports any MCP server of the thread that is not disabled."""
+        await asyncio.sleep(3)
+        try:
+            res = await self.request("mcpServerStatus/list", {"threadId": self.thread_id,
+                                                              "detail": "toolsAndAuthOnly"}, timeout=30)
+        except Exception as e:
+            LOG.write("WARN", f"mcpServerStatus/list failed: {e}")
+            return
+        rows = (res or {}).get("data") or []
+        states = {str(r.get("name")): r.get("runtimeStatus") for r in rows if isinstance(r, dict)}
+        LOG.write("INFO", f"MCP servers for the voice thread: {states}")
+        for name, status in states.items():
+            if status not in ("disabled", None):
+                self._on_mcp_status(name, str(status))
 
     async def list_voices(self) -> bool:
         try:
@@ -986,6 +1140,10 @@ def make_handler(bridge: Bridge):
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            # No Access-Control-* headers, ever: other origins must not read any response.
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Referrer-Policy", "no-referrer")
             self.end_headers()
             self.wfile.write(body)
 
@@ -994,17 +1152,38 @@ def make_handler(bridge: Bridge):
             raw = self.rfile.read(length) if length else b""
             return json.loads(raw.decode("utf-8") or "{}")
 
-        def _local_origin_ok(self):
-            # Refuse cross-site POSTs from other web pages (only our own page or non-browser clients).
+        def _refusal(self, open_path: bool) -> str | None:
+            """Why this request is refused (403), or None. Host must be this server (no DNS
+            rebinding), an Origin must be this server's own, and every path but the page itself
+            needs the per-run token."""
+            port = self.server.server_address[1]
+            own = (f"127.0.0.1:{port}", f"localhost:{port}")
+            if (self.headers.get("Host") or "").lower() not in own:
+                return "host not allowed"
             origin = self.headers.get("Origin")
-            return origin is None or re.fullmatch(r"http://(127\.0\.0\.1|localhost):\d+", origin) is not None
+            if origin is not None and origin.lower() not in tuple(f"http://{h}" for h in own):
+                return "origin not allowed"
+            if open_path:
+                return None
+            got = (self.headers.get("X-Voice-Token") or "").encode("utf-8")
+            if not TOKEN or not hmac.compare_digest(got, TOKEN.encode("utf-8")):
+                return "missing or wrong X-Voice-Token"
+            return None
 
         def do_GET(self):
-            bridge.last_activity = time.monotonic()
             url = urlparse(self.path)
+            why = self._refusal(open_path=url.path in ("/", "/favicon.ico"))
+            if why:
+                LOG.write("HTTP", f"403 GET {url.path}: {why}")
+                self._reply(403, {"ok": False, "error": why})
+                return
+            bridge.last_activity = time.monotonic()
             if url.path == "/":
                 with open(PAGE_PATH, "rb") as f:
-                    self._reply(200, body=page_with_label(f.read()), ctype="text/html; charset=utf-8")
+                    page = page_with_token(page_with_label(f.read()), TOKEN)
+                self._reply(200, body=page, ctype="text/html; charset=utf-8")
+            elif url.path == "/favicon.ico":
+                self._reply(204, body=b"", ctype="image/x-icon")
             elif url.path == "/health":
                 self._reply(200, {"ok": True, "threadId": bridge.app.thread_id, "label": LABEL,
                                   "realtime": bridge.app.realtime_active, "voice": bridge.voice,
@@ -1028,11 +1207,13 @@ def make_handler(bridge: Bridge):
                 self._reply(404, {"ok": False, "error": "not found"})
 
         def do_POST(self):
-            bridge.last_activity = time.monotonic()
-            if not self._local_origin_ok():
-                self._reply(403, {"ok": False, "error": "origin not allowed"})
-                return
             path = urlparse(self.path).path
+            why = self._refusal(open_path=False)
+            if why:
+                LOG.write("HTTP", f"403 POST {path}: {why}")
+                self._reply(403, {"ok": False, "error": why})
+                return
+            bridge.last_activity = time.monotonic()
             try:
                 data = self._json()
             except ValueError:
@@ -1095,7 +1276,8 @@ def make_handler(bridge: Bridge):
                     os.makedirs(LOG_DIR, exist_ok=True)
                     with open(ANSWERS_PATH, "a", encoding="utf-8") as f:
                         f.write(json.dumps({"receivedAt": datetime.now().isoformat(), "id": rid, "status": status,
-                                            "chars": len(answer), "turnId": data.get("turnId")},
+                                            "chars": len(answer), "sha256": short_hash(answer),
+                                            "turnId": data.get("turnId")},
                                            ensure_ascii=False) + "\n")
                     emit({"type": "ack", "id": rid, "status": status})
                     res = bridge.run(bridge.app.deliver_answer(rid, answer, status), 30)
@@ -1346,7 +1528,8 @@ async def selftest_handoff(app: AppServer, args, voice: str | None):
 # ---------------------------------------------------------------- main
 
 async def amain(args):
-    global _stop_cb
+    global _stop_cb, TOKEN
+    TOKEN = secrets.token_urlsafe(32)
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
     reason = {"text": "unknown"}
@@ -1379,7 +1562,7 @@ async def amain(args):
         port = server.server_address[1]
         url = f"http://127.0.0.1:{port}/"
         emit({"type": "ready", "port": port, "pid": os.getpid(), "url": url, "threadId": app.thread_id,
-              "log": LOG.path})
+              "log": LOG.path, "token": TOKEN})
         emit({"type": "voice", "event": "selected", "voice": bridge.voice, "source": bridge.voice_source})
         if args.open:
             subprocess.Popen(["cmd", "/c", "start", "", "msedge", f"--app={url}"],
