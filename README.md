@@ -2,7 +2,7 @@
 
 [日本語版 README](README.ja.md)
 
-Talk to your Claude Code session by voice on Windows. Version 0.3.0 ([CHANGELOG](CHANGELOG.md)).
+Talk to your Claude Code session by voice on Windows. Version 0.3.1 ([CHANGELOG](CHANGELOG.md)).
 
 This is a Claude Code **Mod** (a plugin made of function hooks) plus a small Python helper.
 A realtime voice model from OpenAI, reached through `codex app-server` with your ChatGPT
@@ -34,12 +34,14 @@ Claude Code session. When Claude finishes, the voice reads you a one or two sent
 >   page to OpenAI directly and is never redacted.
 > - **Voice can misfire.** Background speech, a TV, or a misheard phrase can become a request to
 >   Claude. Voice requests run **with the same permissions as your Claude Code session**.
-> - **The guard is not a sandbox.** Dangerous actions in voice-originated turns are blocked by a
->   string-based guard (see below). It is easy to bypass (for example a script that deletes files)
->   and it only covers known patterns.
-> - **Do not use it in folders that contain secrets**, credentials, or anything you would not want
->   read aloud or sent to OpenAI. Use a headset, and turn it off (`/voice off`) when you are not
->   using it.
+> - **The guard is an auxiliary safety net, not a security boundary.** Dangerous actions in
+>   voice-originated turns are blocked by a string-based guard (see below). It is easy to bypass
+>   (for example a script that deletes files) and it only covers known patterns. Keep Claude Code's
+>   normal permission prompts on; do not widen auto-approval because the guard exists.
+> - **Do not use it with data that must not leave your machine**, nor in folders that contain
+>   secrets, credentials, or anything you would not want read aloud or sent to OpenAI (turning
+>   logging off does not change what is sent). Use a headset, and turn it off (`/voice off`) when
+>   you are not using it.
 >
 > The software is provided "as is", without warranty of any kind (see [LICENSE](LICENSE)).
 
@@ -107,8 +109,8 @@ Claude Code session. When Claude finishes, the voice reads you a one or two sent
 
 - Windows 10 or 11 (the helper opens Edge and uses a Windows job object so codex never outlives it).
 - Claude Code **2.1.289 or newer** (desktop app Code tab or CLI) with Mod support. Developed and
-  tested with Claude Code 2.1.289 (live voice tests) and 2.1.293; 0.3.0 (which keeps the guard in
-  `$.state`) was checked with 2.1.295 (`claude plugin validate/test`).
+  tested with Claude Code 2.1.289 (live voice tests) and 2.1.293; 0.3.0 and 0.3.1 (which keep the guard in
+  `$.state`) were checked with 2.1.295 (`claude plugin validate/test`).
 - Microsoft Edge (the voice page runs as an Edge app window).
 - [uv](https://docs.astral.sh/uv/) on `PATH` (it runs the helper; Python 3.11 to 3.13 is fetched
   automatically if needed). The helper uses the standard library only.
@@ -193,7 +195,7 @@ The helper keeps its data **outside the plugin folder**, in a per-user folder:
   debugging, start the helper with `--debug-log` or put `"debugLog": true` in `settings.json`: then
   transcripts and requests are logged too, with secret-looking strings redacted (best effort).
   Answer bodies are never logged.
-- Retention, applied each time the helper starts: log files older than 7 days are deleted, then
+- Retention, applied each time the helper starts (not while it is stopped): log files older than 7 days are deleted, then
   the oldest ones until all of them fit in 20 MB; `voice-answers.jsonl` is rotated past 1 MB.
   To delete everything, remove the `logs` folder while the helper is stopped.
 
@@ -265,8 +267,13 @@ Limits:
   texts) is saved in the session's `$.state` on every change, so a hot reload of the plugin in the
   middle of a voice turn keeps the guard. If that state cannot be read after a reload, the running
   turn and the subagents first seen during it are treated as voice turns until the next turn
-  starts or ends (fail-safe).
-- It is a seat belt, not a sandbox. Do not rely on it for security.
+  starts or ends (fail-safe). If saving fails, the status line shows `guard NOT saved (retrying)`
+  (and a toast once); the guard keeps working in the running module and the save is retried at
+  every later hook. A reloaded module also reads the transcript: if the running turn's prompt
+  carries the voice marker, that turn is guarded even when the saved state is missing or older.
+- Subagents of voice turns are remembered for the whole session (never evicted). Subagents of typed
+  turns are remembered up to 500; one forgotten and seen again during a voice turn counts as voice.
+- It is an auxiliary safety net, not a security boundary. Do not rely on it for security.
 
 ## Troubleshooting
 

@@ -174,7 +174,7 @@ async function loadLabel() {
   try {
     const j = await (await api('/health')).json(); showLabel(j.label || '');
     if (j.blocked) { blocked = true; showBlocked(j.blocked); }
-    if (j.debugLog) $('logNote').textContent = 'Debug logging is on: the log file of the helper also keeps transcripts and requests (secret-looking strings redacted), for 7 days at most.';
+    if (j.debugLog) $('logNote').textContent = 'Debug logging is on: the log file of the helper also keeps transcripts and requests (secret-looking strings redacted). Files older than 7 days are deleted when the helper starts.';
   } catch (e) {}
 }
 async function saveLabel() {

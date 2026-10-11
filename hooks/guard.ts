@@ -105,7 +105,15 @@ const COMMAND_RULES: [RegExp, string][] = [
 ]
 
 
-const MAX_AGENTS = 500 // per set, newest kept, so a snapshot stays small
+/**
+ * Only the typed set is capped (newest kept). Voice-origin agent ids are never evicted: a
+ * background agent of a voice turn may run for the whole session, and forgetting it would turn
+ * it into a typed agent. An id is a few dozen bytes, so even 10,000 voice subagents in one
+ * session keep the saved snapshot near 400 KB. A typed id that was evicted and shows up again
+ * is classified afresh: voice while a voice (or unknown) main turn runs (the safe side), typed
+ * otherwise.
+ */
+export const MAX_TYPED_AGENTS = 500
 
 /**
  * Which tool calls belong to a voice-originated turn.
@@ -151,7 +159,10 @@ export class VoiceScope {
     }
   }
 
-  /** Fail-safe after a reload whose saved scope could not be read. */
+  /**
+   * Fail-safe after a reload whose saved scope could not be read, or whose transcript shows that
+   * the running main turn came in by voice while the saved scope says otherwise.
+   */
   assumeUnknownTurn() {
     this.unknownTurn = true
     this.revision++
@@ -177,8 +188,7 @@ export class VoiceScope {
   addAgent(agentId: string) {
     if (this.agents.has(agentId)) return
     this.typedAgents.delete(agentId)
-    this.agents.add(agentId)
-    trim(this.agents)
+    this.agents.add(agentId) // never evicted (see MAX_TYPED_AGENTS)
     this.revision++
   }
 
@@ -222,7 +232,7 @@ export class VoiceScope {
 }
 
 function trim(set: Set<string>) {
-  while (set.size > MAX_AGENTS) {
+  while (set.size > MAX_TYPED_AGENTS) {
     const oldest = set.values().next().value
     if (oldest === undefined) break
     set.delete(oldest)

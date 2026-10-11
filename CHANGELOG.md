@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.3.1 (2026-10-11)
+
+Fixes for the remaining findings of a third security review of 0.3.0 (commit d3a47fa).
+
+- **Failed guard saves (R1).** A save advances the saved revision only after `$.state.set`
+  succeeded; a failed save stays dirty, is retried at every hook entry, and is shown in the status
+  line (`guard NOT saved (retrying)`) and one toast. The running module keeps guarding the turn in
+  memory. After a hot reload the saved snapshot is cross-checked with the transcript
+  (`$.session.messages()`): a running main turn whose prompt carries the voice marker is guarded
+  even when the snapshot is missing or an older typed one. A fresh typed session is not affected.
+- **Old answers in a new realtime session (R2).** The delayed `appendSpeech` re-send carries the
+  realtime session generation, re-checks it after every wait and, under the start/stop lock, right
+  before sending; a stop or a new start cancels pending re-sends. The first `appendText` of an
+  answer is checked and sent under the same lock.
+- **Long sessions (R3).** Voice-origin subagent ids are never evicted (only typed ones are capped
+  at 500); an unknown agent seen during a voice turn counts as voice.
+- Docs: the page says logs are pruned when the helper starts; the README calls the guard an
+  auxiliary safety net, not a security boundary, and says to keep Claude Code's permission prompts
+  and not to use the Mod with data that must not leave the machine. Helper version aligned (0.3.1).
+
 ## 0.3.0 (2026-10-10)
 
 Fixes for the findings of a security re-review of 0.2.1 (commit 553e449).

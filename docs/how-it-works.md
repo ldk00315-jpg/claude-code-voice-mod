@@ -121,8 +121,20 @@ is voice, the voice and typed subagent ids) and the submitted texts are therefor
 `voice.guard` (contract in `types/index.d.ts`) on every change, before the hook lets the event go on,
 and a new load restores them before its first guard decision. If the saved value cannot be read,
 the running turn and every subagent first seen during it are treated as voice-originated until the
-next main-loop `turn.start` or `turn.complete`. If the `tool.call` guard itself fails before
-deciding, its catch handler denies the blocked kinds of calls whatever the turn.
+next main-loop `turn.start` or `turn.complete`. The saved snapshot is not trusted alone: unless it
+already guards the main loop, the new load reads `$.session.messages()` and, if the prompts of the
+turn still running (after the last final answer or interrupt note) carry the full voice marker,
+guards that turn the same way. An empty transcript, or one ending in a final answer, guards
+nothing, so a fresh typed session is never blocked; if the transcript cannot be read, the snapshot
+stands. A save advances the saved revision only once `$.state.set` succeeded; a failed save keeps
+the scope dirty, is retried at every hook entry (`turn.start`, `tool.call`, `agent.spawn`,
+`turn.complete`, `/voice status`) and shows `guard NOT saved (retrying)` in the status line and one
+toast until a save lands. If the `tool.call` guard itself fails before deciding, its catch handler
+denies the blocked kinds of calls whatever the turn.
+
+Voice-origin subagent ids are never evicted; only typed ones are capped (500, newest kept). An id
+is a few dozen bytes, so the snapshot grows by about 40 bytes per voice subagent (about 400 KB for
+10,000 in one session) plus the submitted texts (at most 50 texts and 200,000 characters).
 `tests/reload.test.ts` loads the module twice over one state store to check this.
 
 ## Thread label

@@ -1,6 +1,6 @@
 // Guard rules and voice scope, as pure functions.
 import { describe, expect, test } from 'claude-code/testing'
-import { VoiceScope, checkCommand, checkVoiceToolCall } from '../hooks/guard.ts'
+import { MAX_TYPED_AGENTS, VoiceScope, checkCommand, checkVoiceToolCall } from '../hooks/guard.ts'
 import { NOTICE, isVoicePrompt, promptFor } from '../hooks/prompt.ts'
 
 const DENY_COMMANDS = [
@@ -172,6 +172,44 @@ describe('VoiceScope', () => {
     t.turnStarted('V1', true)
     expect(t.isVoice('seen-typed')).toBe(false) // remembered as typed
     t.turnCompleted('V1')
+  })
+
+  test('voice agents are never evicted, however many there are (R3)', () => {
+    const s = new VoiceScope()
+    s.turnStarted('V1', true)
+    s.addAgent('old-bg') // a background agent of the voice turn, still running later
+    for (let i = 0; i < 1200; i++) s.addAgent(`voice-${i}`)
+    s.turnCompleted('V1')
+    s.turnStarted('U1', false) // typed turn afterwards
+    expect(s.isVoice('old-bg')).toBe(true)
+    expect(s.isVoice('voice-0')).toBe(true)
+    expect(s.snapshot().agents.length).toBe(1201)
+    // The snapshot stays small: about 1,200 ids in well under 64 KB of JSON.
+    expect(JSON.stringify(s.snapshot()).length < 64 * 1024).toBe(true)
+    // ...and survives a reload.
+    const t = new VoiceScope()
+    expect(t.restore(JSON.parse(JSON.stringify(s.snapshot())))).toBe(true)
+    expect(t.isVoice('old-bg')).toBe(true)
+  })
+
+  test('typed agents are capped; an evicted one is classified afresh, voice-side during a voice turn', () => {
+    const s = new VoiceScope()
+    s.turnStarted('U1', false)
+    s.addTypedAgent('typed-old')
+    for (let i = 0; i < MAX_TYPED_AGENTS; i++) s.addTypedAgent(`typed-${i}`)
+    expect(s.snapshot().typedAgents.length).toBe(MAX_TYPED_AGENTS)
+    expect(s.snapshot().typedAgents.includes('typed-old')).toBe(false) // evicted
+    expect(s.isVoice('typed-old')).toBe(false) // seen again outside a voice turn: typed
+    s.turnCompleted('U1')
+
+    const t = new VoiceScope()
+    t.turnStarted('U1', false)
+    t.addTypedAgent('typed-old')
+    for (let i = 0; i < MAX_TYPED_AGENTS; i++) t.addTypedAgent(`typed-${i}`)
+    t.turnCompleted('U1')
+    t.turnStarted('V1', true)
+    expect(t.isVoice('typed-old')).toBe(true) // unknown again, seen in a voice turn: the safe side
+    expect(t.isVoice('typed-1')).toBe(false) // still remembered as typed
   })
 })
 

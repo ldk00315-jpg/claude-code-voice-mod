@@ -897,6 +897,7 @@ class AppServer:
         self.purpose = None  # "conversation" | "preview" while realtime runs
         self._session_gen = 0  # bumped by every realtime start and stop
         self._rt_lock = asyncio.Lock()  # start_realtime / stop_realtime run one at a time
+        self._spoken_tasks: set[asyncio.Task] = set()  # pending _ensure_spoken re-sends
         self.mcp_blocked: str | None = None  # why no realtime session may run (MCP isolation)
         self.cli_mcp_names: list[str] = []  # servers the -c override disabled at spawn
         # handoffs from the realtime model -> requests for Claude Code
@@ -1156,23 +1157,29 @@ class AppServer:
         `session.context.append` on the sideband socket (methods_common.rs; appendSpeech adds
         channel "speakable"). appendText is used first (the selftest showed it makes the model
         speak); if no assistant transcript follows, one retry goes through appendSpeech."""
-        why = self.answer_refusal(rid)
-        if why:
-            return {"ok": False, "error": why, "refused": True}
-        req = self.requests[rid]
-        if not self.realtime_active:
-            emit({"type": "answer_undelivered", "id": rid, "error": "realtime not running"})
-            return {"ok": False, "error": "realtime not running"}
-        # Claude's answer goes to the realtime model (OpenAI): secret-looking strings out first.
-        msg = answer_message(status, req["text"], redact_secrets(answer))
-        late = req["answered"]
-        req["answered"] = True
-        seq = self.assistant_seq
-        await self.request("thread/realtime/appendText",
-                           {"threadId": self.thread_id, "text": msg, "role": "user"}, timeout=20)
-        emit({"type": "answer_delivered", "id": rid, "status": status, "chars": len(msg),
-              "via": "appendText", "again": late})
-        asyncio.create_task(self._ensure_spoken(rid, msg, seq))
+        # Checked and sent under the start/stop lock: a realtime session that stops or restarts
+        # meanwhile cannot receive an answer of the session the request belongs to.
+        async with self._rt_lock:
+            why = self.answer_refusal(rid)
+            if why:
+                return {"ok": False, "error": why, "refused": True}
+            req = self.requests[rid]
+            if not self.realtime_active:
+                emit({"type": "answer_undelivered", "id": rid, "error": "realtime not running"})
+                return {"ok": False, "error": "realtime not running"}
+            # Claude's answer goes to the realtime model (OpenAI): secret-looking strings out first.
+            msg = answer_message(status, req["text"], redact_secrets(answer))
+            late = req["answered"]
+            req["answered"] = True
+            seq = self.assistant_seq
+            gen = self._session_gen
+            await self.request("thread/realtime/appendText",
+                               {"threadId": self.thread_id, "text": msg, "role": "user"}, timeout=20)
+            emit({"type": "answer_delivered", "id": rid, "status": status, "chars": len(msg),
+                  "via": "appendText", "again": late})
+            task = asyncio.create_task(self._ensure_spoken(rid, msg, seq, gen))
+            self._spoken_tasks.add(task)
+            task.add_done_callback(self._spoken_tasks.discard)
         return {"ok": True, "chars": len(msg)}
 
     def answer_refusal(self, rid: str) -> str | None:
@@ -1185,20 +1192,38 @@ class AppServer:
             return "request belongs to an earlier realtime session"
         return None
 
-    async def _ensure_spoken(self, rid: str, msg: str, seq: int):
+    def _spoken_still_due(self, seq: int, gen: int) -> bool:
+        """Whether a re-send of an answer given in realtime session `gen` may still go out."""
+        return self._session_gen == gen and self.realtime_active and self.assistant_seq <= seq
+
+    def _cancel_spoken_tasks(self):
+        """Drops the pending re-sends (the realtime session stops or a new one starts)."""
+        current = asyncio.current_task()
+        for task in list(self._spoken_tasks):
+            if task is not current:
+                task.cancel()
+        self._spoken_tasks.clear()
+
+    async def _ensure_spoken(self, rid: str, msg: str, seq: int, gen: int):
+        """One re-send via appendSpeech if no assistant transcript followed the answer. Only into
+        the realtime session the answer was given in (`gen`): re-checked after every wait and,
+        under the start/stop lock, right before sending; a stop or a new start also cancels it."""
         for _ in range(ANSWER_SPOKEN_CHECK_SECONDS * 2):
             await asyncio.sleep(0.5)
-            if self.assistant_seq > seq or not self.realtime_active:
+            if not self._spoken_still_due(seq, gen):
                 return
-        LOG.write("WARN", f"no assistant transcript {ANSWER_SPOKEN_CHECK_SECONDS}s after answer {rid}; "
-                          "retrying via appendSpeech")
-        try:
-            await self.request("thread/realtime/appendSpeech", {"threadId": self.thread_id, "text": msg},
-                               timeout=20)
-            emit({"type": "answer_delivered", "id": rid, "chars": len(msg), "via": "appendSpeech",
-                  "again": True})
-        except Exception as e:
-            emit({"type": "answer_undelivered", "id": rid, "error": f"appendSpeech: {e}"})
+        async with self._rt_lock:
+            if not self._spoken_still_due(seq, gen):
+                return
+            LOG.write("WARN", f"no assistant transcript {ANSWER_SPOKEN_CHECK_SECONDS}s after answer {rid}; "
+                              "retrying via appendSpeech")
+            try:
+                await self.request("thread/realtime/appendSpeech", {"threadId": self.thread_id, "text": msg},
+                                   timeout=20)
+                emit({"type": "answer_delivered", "id": rid, "chars": len(msg), "via": "appendSpeech",
+                      "again": True})
+            except Exception as e:
+                emit({"type": "answer_undelivered", "id": rid, "error": f"appendSpeech: {e}"})
 
     async def _interrupt(self, turn_id: str):
         try:
@@ -1340,6 +1365,7 @@ class AppServer:
                   "purpose": purpose})
             self._session_gen += 1
             gen = self._session_gen
+            self._cancel_spoken_tasks()  # nothing of an earlier session is re-sent into this one
             try:
                 await self.request("thread/realtime/start", params, timeout=30)
                 answer = await asyncio.wait_for(self._sdp_wait, SDP_TIMEOUT)
@@ -1374,6 +1400,7 @@ class AppServer:
         if not self.thread_id:
             return
         self._session_gen += 1  # answers for requests of the stopped session are refused
+        self._cancel_spoken_tasks()  # and their pending re-sends are dropped
         try:
             await self.request("thread/realtime/stop", {"threadId": self.thread_id}, timeout=10)
         except Exception as e:

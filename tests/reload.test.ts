@@ -12,22 +12,27 @@ type Hook = (...args: unknown[]) => unknown
 type Loaded = { hooks: Map<string, Hook>; catches: Map<string, Hook> }
 
 /** The host's session state, shared by every load of the module. */
-function stateStore(options: { failReads?: boolean } = {}) {
+function stateStore(options: { failReads?: boolean; failWrites?: boolean } = {}) {
   const values = new Map<string, unknown>()
   let version = 0
-  return {
+  const store = {
     values,
+    failWrites: options.failWrites ?? false,
+    writes: 0,
     get: async (ref: { plugin: string; key: string }) => {
       if (options.failReads) throw new Error('state unavailable')
       const value = values.get(`${ref.plugin}/${ref.key}`)
       return { value: value === undefined ? undefined : JSON.parse(JSON.stringify(value)), version }
     },
     set: async (ref: { plugin: string; key: string }, value: unknown) => {
+      store.writes++
+      if (store.failWrites) throw new Error('state write refused')
       values.set(`${ref.plugin}/${ref.key}`, JSON.parse(JSON.stringify(value)))
       version++
       return { isSet: true, version }
     },
   }
+  return store
 }
 
 /** One load of the module: runs register against a recording `on`. */
@@ -43,15 +48,34 @@ function load(): Loaded {
   return { hooks, catches }
 }
 
-function engine(state: ReturnType<typeof stateStore>) {
+type Row = { role: 'user' | 'assistant'; text: string; toolUses: unknown[]; toolResults?: unknown[] }
+
+/**
+ * The engine's `$` for one load. `transcript` is what `$.session.messages()` answers (left out:
+ * the call throws, as when the transcript cannot be read).
+ */
+function engine(state: ReturnType<typeof stateStore>, transcript?: () => Row[]) {
   const toasts: string[] = []
+  const statuses: (string | undefined)[] = []
   const $ = {
-    state: { get: state.get, set: state.set },
-    ui: { toast: (t: string) => void toasts.push(t), status: () => undefined, log: () => undefined },
+    state: { get: state.get, set: (ref: { plugin: string; key: string }, value: unknown) => state.set(ref, value) },
+    ui: { toast: (t: string) => void toasts.push(t), status: (t?: string) => void statuses.push(t), log: () => undefined },
     command: { register: async () => undefined },
+    session: {
+      messages: async () => {
+        if (!transcript) throw new Error('transcript unavailable')
+        return transcript()
+      },
+    },
   }
-  return { $, toasts }
+  return { $, toasts, statuses }
 }
+
+/** Rows of a transcript: a prompt, an assistant reply calling a tool, its result, a final answer. */
+const prompt = (text: string): Row => ({ role: 'user', text, toolUses: [] })
+const callingTool: Row = { role: 'assistant', text: 'Let me run it.', toolUses: [{ id: 't1', name: 'Bash', input: {} }] }
+const toolResult: Row = { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 't1', text: 'ok', isError: false }] }
+const finalAnswer: Row = { role: 'assistant', text: 'Done.', toolUses: [] }
 
 const reached = { text: 'reached core' }
 const next = async () => reached
@@ -151,4 +175,79 @@ test('the guard refuses blocked kinds when it fails before deciding', async () =
   expect(denied.deny ?? '').toContain('could not check')
   const passed = (await handler?.({}, { tool: 'Bash', command: 'ls' }, notCalled)) as { text?: string }
   expect(passed.text).toBe('reached core')
+})
+
+// R1 of the third security review: a failed save, then a reload in the running voice turn.
+const PUSH = { tool: 'Bash', command: 'git push origin main' }
+
+test('save fails at a voice turn start, reload with nothing saved: the transcript keeps the guard', async () => {
+  const state = stateStore({ failWrites: true })
+  const running = () => [prompt(promptFor('push the branch')), callingTool]
+  const { $, toasts, statuses } = engine(state, running)
+  const first = load()
+  await first.hooks.get('turn.start')?.($, { text: promptFor('push the branch'), turnId: 'V1' }, next)
+  expect(await call(first, $, PUSH)).toContain('came in by voice') // guarded in memory
+  expect(toasts.filter(t => t.includes('could not be saved')).length).toBe(1) // one toast
+  expect(statuses.at(-1) ?? '').toContain('NOT saved')
+  expect(state.values.size).toBe(0)
+
+  const second = load() // the reload: the store answers undefined, no turn.start for V1
+  expect(await call(second, engine(state, running).$, PUSH)).toContain('came in by voice')
+  expect(await call(second, engine(state, running).$, { tool: 'Bash', command: 'ls' })).toBe('reached core')
+  // The running turn ends: typed work afterwards is not blocked.
+  await second.hooks.get('turn.complete')?.($, { ...DONE, turnId: 'V1' }, async () => ({ text: 'ok' }))
+  await second.hooks.get('turn.start')?.($, { text: 'typed', turnId: 'U2' }, next)
+  expect(await call(second, $, PUSH)).toBe('reached core')
+})
+
+test('save fails at a voice turn start, reload over an older typed snapshot: still guarded', async () => {
+  const state = stateStore()
+  const { $ } = engine(state, () => [])
+  const first = load()
+  await first.hooks.get('turn.start')?.($, { text: 'typed work', turnId: 'U1' }, next)
+  await first.hooks.get('turn.complete')?.($, { ...DONE, turnId: 'U1' }, async () => ({ text: 'ok' }))
+  expect(state.values.size).toBe(1) // a typed snapshot landed
+
+  state.failWrites = true
+  const transcript = () => [prompt('typed work'), finalAnswer, prompt(promptFor('push it')), callingTool]
+  const live = engine(state, transcript).$
+  await first.hooks.get('turn.start')?.(live, { text: promptFor('push it'), turnId: 'V1' }, next)
+  const second = load()
+  expect(await call(second, live, PUSH)).toContain('came in by voice')
+})
+
+test('a failed save is retried at the next hook entry and the warning clears', async () => {
+  const state = stateStore({ failWrites: true })
+  const { $, statuses } = engine(state, () => [])
+  const first = load()
+  await first.hooks.get('turn.start')?.($, { text: promptFor('push it'), turnId: 'V1' }, next)
+  const failed = state.writes
+  await call(first, $, PUSH) // nothing changed, but the unsaved revision is tried again
+  expect(state.writes).toBe(failed + 1)
+  state.failWrites = false
+  expect(await call(first, $, PUSH)).toContain('came in by voice')
+  const saved = state.values.get('voice/guard') as { scope: { mainIsVoice: boolean; mainTurn: string } }
+  expect(saved.scope.mainIsVoice).toBe(true)
+  expect(saved.scope.mainTurn).toBe('V1')
+  expect((statuses.at(-1) ?? '').includes('NOT saved')).toBe(false)
+  // Saved now: a reload with an unreadable transcript is guarded by the snapshot alone.
+  const second = load()
+  expect(await call(second, engine(state).$, PUSH)).toContain('came in by voice')
+})
+
+test('a brand-new typed session is not blocked by the transcript cross-check', async () => {
+  const state = stateStore()
+  const fresh = load()
+  const { $ } = engine(state, () => [])
+  await fresh.hooks.get('session.start')?.($, {}, async () => ({}))
+  expect(await call(fresh, $, PUSH)).toBe('reached core')
+
+  // A reload during a typed turn that follows a finished and an interrupted voice turn.
+  const transcript = (): Row[] => [
+    prompt(promptFor('look at the logs')), callingTool, toolResult, finalAnswer,
+    prompt(promptFor('push it')), callingTool, prompt('[Request interrupted by user for tool use]'),
+    prompt('please git push'), callingTool,
+  ]
+  const second = load()
+  expect(await call(second, engine(stateStore(), transcript).$, PUSH)).toBe('reached core')
 })

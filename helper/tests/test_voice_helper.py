@@ -480,6 +480,110 @@ class RealtimeLock(unittest.TestCase):
         self.assertEqual(order[-2:], ["thread/realtime/start>", "thread/realtime/start<"])
 
 
+class SpokenResendGeneration(unittest.TestCase):
+    """R2 (third review): the delayed appendSpeech re-send never reaches a newer realtime session."""
+
+    def setUp(self):
+        EMITTED.clear()
+        self.saved_check = vh.ANSWER_SPOKEN_CHECK_SECONDS
+        vh.ANSWER_SPOKEN_CHECK_SECONDS = 1  # re-send after 1 s instead of 12
+
+    def tearDown(self):
+        vh.ANSWER_SPOKEN_CHECK_SECONDS = self.saved_check
+
+    def _app(self):
+        app = FakeApp()
+
+        async def request(method, params, timeout=60):  # records every RPC, answers start's SDP
+            app.calls.append((method, params))
+            if method == "thread/realtime/start":
+                app._sdp_wait.set_result("answer-sdp")
+            return {}
+
+        app.request = request
+        return app
+
+    def _methods(self, app):
+        return [m for m, _ in app.calls]
+
+    def test_stop_and_start_during_the_wait_drop_the_resend(self):
+        app = self._app()
+
+        async def run():
+            await app.start_realtime("o1", "v3", "cove")
+            app._on_handoff({"handoff_id": "h1", "input_transcript": "check the logs"})
+            res = await app.deliver_answer("h1", "Three errors.", "ok")
+            self.assertTrue(res["ok"])
+            self.assertEqual(len(app._spoken_tasks), 1)
+            await asyncio.sleep(0.2)
+            await app.stop_realtime()  # real stop and start while the re-send waits
+            await app.start_realtime("o2", "v3", "cove")
+            self.assertEqual(len(app._spoken_tasks), 0)  # cancelled
+            await asyncio.sleep(1.5)  # past the re-send time
+            # The old request is refused for the new session as well.
+            late = await app.deliver_answer("h1", "Three errors.", "ok")
+            self.assertTrue(late.get("refused"))
+
+        asyncio.run(run())
+        self.assertNotIn("thread/realtime/appendSpeech", self._methods(app))
+        self.assertEqual(self._methods(app).count("thread/realtime/appendText"), 1)
+
+    def test_generation_is_checked_even_if_the_task_was_not_cancelled(self):
+        app = self._app()
+
+        async def run():
+            await app.start_realtime("o1", "v3", "cove")
+            app._on_handoff({"handoff_id": "h1", "input_transcript": "check the logs"})
+            await app.deliver_answer("h1", "Three errors.", "ok")
+            app._spoken_tasks.clear()  # as if the task had escaped the cancel
+            await asyncio.sleep(0.2)
+            await app.stop_realtime()
+            await app.start_realtime("o2", "v3", "cove")
+            await asyncio.sleep(1.5)
+
+        asyncio.run(run())
+        self.assertNotIn("thread/realtime/appendSpeech", self._methods(app))
+
+    def test_resend_still_goes_out_in_the_same_session(self):
+        app = self._app()
+
+        async def run():
+            await app.start_realtime("o1", "v3", "cove")
+            app._on_handoff({"handoff_id": "h1", "input_transcript": "check the logs"})
+            await app.deliver_answer("h1", "Three errors.", "ok")
+            await asyncio.sleep(1.5)
+
+        asyncio.run(run())
+        self.assertEqual(self._methods(app).count("thread/realtime/appendSpeech"), 1)
+
+    def test_initial_answer_waits_for_a_running_start_and_is_then_refused(self):
+        app = self._app()
+        gate = asyncio.Event()
+
+        async def run():
+            await app.start_realtime("o1", "v3", "cove")
+            app._on_handoff({"handoff_id": "h1", "input_transcript": "check the logs"})
+            real = app.request
+
+            async def slow(method, params, timeout=60):
+                if method == "thread/realtime/start":
+                    await gate.wait()
+                return await real(method, params, timeout)
+
+            app.request = slow
+            restart = asyncio.create_task(app.start_realtime("o2", "v3", "cove"))
+            await asyncio.sleep(0.05)  # the restart holds the lock; the answer must wait
+            answer = asyncio.create_task(app.deliver_answer("h1", "Three errors.", "ok"))
+            await asyncio.sleep(0.05)
+            gate.set()
+            await restart
+            return await answer
+
+        res = asyncio.run(run())
+        self.assertTrue(res.get("refused"))
+        self.assertNotIn("thread/realtime/appendText", self._methods(app))
+
+
 class SecretAssignments(unittest.TestCase):
     """F5: a secret-named value is hidden whatever its form, short numbers included."""
 

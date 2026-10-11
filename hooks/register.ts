@@ -15,13 +15,18 @@
 // denies destructive deletes, git push, gh writes, publishes, sends, browser/computer use,
 // scheduled tasks and sending/deleting MCP tools (hooks/guard.ts). Typed turns are untouched.
 // The guard's scope is saved in `$.state` on every change, so a hot reload of this module in
-// the middle of a voice turn restores it before the next tool call (see restore / save).
-import type { EngineInterface, HookStream, On, ProcessSpawnChunk, ProcessSpawnResult, Register } from 'claude-code'
+// the middle of a voice turn restores it before the next tool call (see restore / save). A save
+// that fails is retried at every hook entry and shown in the status line; after a reload the
+// saved scope is cross-checked with the transcript, so a lost or stale save still guards a
+// running voice turn.
+import type { EngineInterface, HookStream, On, ProcessSpawnChunk, ProcessSpawnResult, Register, SessionMessage } from 'claude-code'
 import type { GuardState } from '../types'
 import { VoiceScope, checkVoiceToolCall, denyMessage } from './guard.ts'
 import { MARK, isVoicePrompt, promptFor } from './prompt.ts'
 
 const NAME = 'voice'
+const UNSAVED = 'guard NOT saved (retrying)'
+const UNSAVED_TOAST = 'voice: the voice guard could not be saved; a reload of this Mod now may drop it. Retrying.'
 const GUARD = { plugin: 'voice', key: 'guard' } as const
 
 /**
@@ -90,8 +95,10 @@ type Load = {
   // starting turn is a voice turn, even after its job timed out or `/voice off` dropped the queue.
   submittedTexts: string[]
   restored: Promise<void> | null
-  savedRevision: number
-  saving: Promise<unknown>
+  savedRevision: number // the scope revision the host holds (advanced only by a landed write)
+  pendingRevision: number // the revision a write is under way for
+  saving: Promise<boolean>
+  unsaved: boolean // the last write failed: warned in the status line until one lands
 }
 
 function newLoad(): Load {
@@ -105,17 +112,54 @@ function newLoad(): Load {
     submittedTexts: [],
     restored: null,
     savedRevision: -1,
-    saving: Promise.resolve(),
+    pendingRevision: -1,
+    saving: Promise.resolve(true),
+    unsaved: false,
   }
+}
+
+/** The note the engine adds when the user stops a turn: that turn has ended. */
+const INTERRUPTED = /^\[Request interrupted by user/
+
+/**
+ * Whether the main turn that is running (per the transcript) came in by voice: the user prompts
+ * of the newest turn that has not ended carry the full voice marker. A turn has ended at its
+ * final answer (an assistant message with no tool use that ends the assistant's reply) or at the
+ * engine's interrupt note; prompts after the last such point belong to the running
+ * turn (a prompt queued into it mid-turn included). No running turn (empty transcript, or the
+ * newest message is a final answer) is not a voice turn, so a fresh typed session is not blocked.
+ */
+export function runningTurnIsVoice(messages: readonly SessionMessage[]): boolean {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i]
+    if (!msg) continue
+    if (msg.role === 'assistant') {
+      // A final answer: no tool use, and nothing but a user message (or nothing) after it. (One
+      // reply may be split into several assistant messages, text first and tool use next.)
+      const after = messages[i + 1]
+      if (msg.toolUses.length === 0 && (after === undefined || after.role === 'user')) return false
+      continue
+    }
+    if ((msg.toolResults?.length ?? 0) > 0) continue // a tool result, not a prompt
+    if (isVoicePrompt(msg.text)) return true
+    if (INTERRUPTED.test(msg.text)) return false // the turn before it was cut off: it has ended
+  }
+  return false
 }
 
 /**
  * Restores the guard saved by an earlier load of this module, once per load. If it cannot be
  * read, the turn that is running is treated as a voice turn until the next main-loop
  * turn.start or turn.complete (fail-safe without blocking typed work for good).
+ *
+ * The snapshot alone is not trusted: an earlier load may have failed to save it (or saved it
+ * before the voice turn started). So, unless the snapshot already guards the main loop, the
+ * transcript is read and a running main turn whose prompt carries the voice marker is guarded
+ * the same fail-safe way. If the transcript cannot be read, the snapshot stands.
  */
 function restore(m: Load, $: EngineInterface): Promise<void> {
   m.restored ??= (async () => {
+    let readable = true
     try {
       const { value } = await $.state.get(GUARD)
       if (value !== undefined) {
@@ -123,22 +167,56 @@ function restore(m: Load, $: EngineInterface): Promise<void> {
         m.submittedTexts = Array.isArray(value.submitted) ? value.submitted.filter(t => typeof t === 'string') : []
       }
     } catch (err) {
+      readable = false
       m.scope.assumeUnknownTurn()
       $.ui.log(`voice: guard state not restored (${String(err)}); guarding the running turn`, { to: 'debug' })
+    }
+    if (readable && !m.scope.voiceTurnRunning) {
+      try {
+        if (runningTurnIsVoice(await $.session.messages())) {
+          m.scope.assumeUnknownTurn()
+          $.ui.log('voice: the transcript shows a running voice turn the saved guard missed; guarding it', { to: 'debug' })
+        }
+      } catch (err) {
+        $.ui.log(`voice: transcript not read for the guard cross-check (${String(err)})`, { to: 'debug' })
+      }
     }
     m.savedRevision = m.scope.revision // nothing new to save yet
   })()
   return m.restored
 }
 
-/** Saves the guard when it changed; resolves once the write landed (or failed). */
-function save(m: Load, $: EngineInterface): Promise<unknown> {
-  if (m.scope.revision === m.savedRevision) return m.saving
-  m.savedRevision = m.scope.revision
+/**
+ * Saves the guard when it changed. The saved revision advances only once the write landed; a
+ * failed write leaves the scope unsaved, warns (status line, one toast), and the next call
+ * (every hook entry calls this) tries again. Resolves whether the scope is saved now.
+ */
+function save(m: Load, $: EngineInterface): Promise<boolean> {
+  const revision = m.scope.revision
+  if (revision === m.savedRevision) return Promise.resolve(true)
+  if (revision === m.pendingRevision) return m.saving
+  m.pendingRevision = revision
   const value: GuardState = { scope: m.scope.snapshot(), submitted: [...m.submittedTexts] }
-  m.saving = m.saving
-    .then(() => $.state.set(GUARD, value))
-    .catch(err => $.ui.log(`voice: guard state not saved: ${String(err)}`, { to: 'debug' }))
+  m.saving = m.saving.then(async () => {
+    try {
+      await $.state.set(GUARD, value)
+      if (revision > m.savedRevision) m.savedRevision = revision
+      if (m.unsaved && revision === m.scope.revision) {
+        m.unsaved = false
+        show(m, $, m.phase)
+      }
+      return true
+    } catch (err) {
+      if (m.pendingRevision === revision) m.pendingRevision = -1 // retried by the next call
+      $.ui.log(`voice: guard state not saved: ${String(err)}`, { to: 'debug' })
+      if (!m.unsaved) {
+        m.unsaved = true
+        $.ui.toast(UNSAVED_TOAST)
+      }
+      show(m, $, m.phase)
+      return false
+    }
+  })
   return m.saving
 }
 
@@ -154,7 +232,8 @@ function rememberSubmitted(m: Load, text: string) {
 
 function show(m: Load, $: EngineInterface, next: string) {
   m.phase = next
-  $.ui.status(next === 'stopped' ? undefined : `voice: ${next}`)
+  const parts = [...(m.unsaved ? [UNSAVED] : []), ...(next === 'stopped' ? [] : [next])]
+  $.ui.status(parts.length ? `voice: ${parts.join(' | ')}` : undefined)
 }
 
 function queued(m: Load): number {
@@ -399,7 +478,9 @@ export function loadVoiceMod(on: On) {
       : m.scope.voiceTurnRunning
         ? ' (voice turn running: guard on)'
         : ''
-    return { text: `voice: ${m.phase}${m.port ? ` port=${m.port}` : ''}${list ? ` jobs=[${list}]` : ''}${guard}` }
+    await save(m, $)
+    const unsaved = m.unsaved ? ` (${UNSAVED})` : ''
+    return { text: `voice: ${m.phase}${m.port ? ` port=${m.port}` : ''}${list ? ` jobs=[${list}]` : ''}${guard}${unsaved}` }
   })
 
   // Correlation: a plugin's own hooks do not see its own $.prompt.submit, so the
@@ -419,7 +500,9 @@ export function loadVoiceMod(on: On) {
     }
     const voice = job !== undefined || isVoicePrompt(e.text) || m.submittedTexts.some(t => e.text.includes(t))
     m.scope.turnStarted(e.turnId, voice)
-    await save(m, $) // before any tool call of the turn can run
+    // Before any tool call of the turn can run. If it fails, this load still guards the turn
+    // in memory, the status line warns, and every later hook entry retries.
+    await save(m, $)
     return next(e)
   })
 
