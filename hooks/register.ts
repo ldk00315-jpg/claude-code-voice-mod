@@ -156,6 +156,12 @@ export function runningTurnIsVoice(messages: readonly SessionMessage[]): boolean
  * before the voice turn started). So, unless the snapshot already guards the main loop, the
  * transcript is read and a running main turn whose prompt carries the voice marker is guarded
  * the same fail-safe way. If the transcript cannot be read, the snapshot stands.
+ *
+ * Known gaps (security review 4, documented in the README): when the state could not be saved
+ * and the module is reloaded, the guard is lost if (a) the snapshot is missing/typed AND the
+ * transcript cannot be read, or (b) a voice turn's background subagent is still running after
+ * that turn ended (the transcript shows no running voice turn and the subagent's origin was never
+ * saved). The status line shows `guard NOT saved` meanwhile; users are told not to reload then.
  */
 function restore(m: Load, $: EngineInterface): Promise<void> {
   m.restored ??= (async () => {

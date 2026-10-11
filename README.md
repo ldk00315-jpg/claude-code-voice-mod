@@ -38,6 +38,11 @@ Claude Code session. When Claude finishes, the voice reads you a one or two sent
 >   voice-originated turns are blocked by a string-based guard (see below). It is easy to bypass
 >   (for example a script that deletes files) and it only covers known patterns. Keep Claude Code's
 >   normal permission prompts on; do not widen auto-approval because the guard exists.
+> - **Experimental release for small trials.** Use it yourself or share it with a few people who
+>   understand the points above. It has had four rounds of security review (see
+>   [Security reviews](#security-reviews)); some edge cases of the guard remain open, and nothing
+>   was tested end to end against the live services by the reviewers. Do not present it as
+>   something that reliably prevents dangerous actions.
 > - **Do not use it with data that must not leave your machine**, nor in folders that contain
 >   secrets, credentials, or anything you would not want read aloud or sent to OpenAI (turning
 >   logging off does not change what is sent). Use a headset, and turn it off (`/voice off`) when
@@ -271,8 +276,16 @@ Limits:
   (and a toast once); the guard keeps working in the running module and the save is retried at
   every later hook. A reloaded module also reads the transcript: if the running turn's prompt
   carries the voice marker, that turn is guarded even when the saved state is missing or older.
-- Subagents of voice turns are remembered for the whole session (never evicted). Subagents of typed
-  turns are remembered up to 500; one forgotten and seen again during a voice turn counts as voice.
+- **Known gaps while saving fails.** If the state could not be saved *and* the plugin is reloaded,
+  the guard can be lost in two cases: (a) the transcript cannot be read either, so the running
+  voice turn is not recognised; (b) a background subagent started by a voice turn keeps running
+  after that turn has ended (the transcript no longer shows a running voice turn, and the
+  subagent's origin was never saved). So **while `guard NOT saved` is shown, do not reload or
+  update the plugin and do not leave background work running**: wait until the warning clears, or
+  stop with `/voice off` and let running work finish under Claude's normal permission prompts.
+- Subagents of voice turns are remembered for the whole session (never evicted), as long as the
+  state can be saved (see above). Subagents of typed turns are remembered up to 500; one forgotten
+  and seen again during a voice turn counts as voice.
 - It is an auxiliary safety net, not a security boundary. Do not rely on it for security.
 
 ## Troubleshooting
@@ -305,6 +318,24 @@ uv run --project helper python -m unittest discover -s helper/tests
 Headless self tests that talk to the real service (they use your ChatGPT plan; no microphone):
 `uv run --project helper --group selftest helper/voice_helper.py --selftest-text "Hello"` and
 `--selftest-handoff "..."` (see the helper's docstring).
+
+## Security reviews
+
+The project went through four rounds of third-party security review (static review plus mock-based
+probes; no live API calls, microphone recordings or penetration test). Each round's findings were
+fixed in the next release; see [CHANGELOG.md](CHANGELOG.md).
+
+| Round | Reviewed commit | Outcome |
+| --- | --- | --- |
+| 1 | `2dbfc29` (0.2.0) | Guard bypass after timeout/`/voice off`, unauthenticated local HTTP, MCP leak, unredacted answers. Fixed in 0.2.1. |
+| 2 | `553e449` (0.2.1) | Mid-turn hot reload, token readable from the page, dotted MCP names, logging on by default, HTTP limits. Fixed in 0.3.0. |
+| 3 | `d3a47fa` (0.3.0) | Unsaved guard state lost on reload, stale answer re-sent into a new session, eviction after 500 agents. Fixed in 0.3.1. |
+| 4 | `deeac60` (0.3.1, tag `v0.3.1`) | Earlier fixes confirmed. Remaining: the two "known gaps while saving fails" listed under [Voice-origin guard](#voice-origin-guard). No real secrets, no unauthenticated remote code execution found. |
+
+Reviewer's verdict for 0.3.1: fine for your own use and for small trials by people who understand
+the data sent to OpenAI, the shared Claude permissions and the experimental API; **not** fine to
+distribute as a guard that reliably prevents dangerous actions. Real Claude Code hot reloads,
+live Codex/OpenAI sessions and other OS users' access were not tested by the reviewers.
 
 ## License
 

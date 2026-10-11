@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+Documentation after the fourth security review of 0.3.1 (commit deeac60); no behaviour change.
+
+- README (en/ja): "Experimental release for small trials" in the disclaimer; the two known gaps of
+  the guard while its state cannot be saved (transcript also unreadable; a voice turn's background
+  subagent still running after the turn ended) and what to do while `guard NOT saved` is shown;
+  a "Security reviews" section with the four rounds and the reviewer's verdict.
+- Code comments in `hooks/register.ts` describe the same gaps where the guard is restored.
+- The helper reports version 0.3.1 to `codex app-server` (`clientInfo`), matching the plugin.
+
 ## 0.3.1 (2026-10-11)
 
 Fixes for the remaining findings of a third security review of 0.3.0 (commit d3a47fa).

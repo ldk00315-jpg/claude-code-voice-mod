@@ -1235,7 +1235,7 @@ class AppServer:
     # -- high level
     async def handshake(self):
         init = await self.request("initialize", {
-            "clientInfo": {"name": "claude_voice_mod", "title": "Claude Voice Mod", "version": "0.3.0"},
+            "clientInfo": {"name": "claude_voice_mod", "title": "Claude Voice Mod", "version": "0.3.1"},
             "capabilities": {"experimentalApi": True, "requestAttestation": False},
         }, timeout=60)
         await self.notify("initialized")
