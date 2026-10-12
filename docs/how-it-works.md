@@ -16,7 +16,7 @@ The codex realtime API is experimental: any of this can change.
 | `hooks/prompt.ts` | The `[voice] ...` prompt submitted to Claude Code. |
 | `tests/*.test.ts` | `claude plugin test`: guard rules, a full round trip against a fake helper, and hot reloads in the middle of a voice turn. |
 | `helper/voice_helper.py` | Runs `codex app-server`, relays SDP, turns handoffs into requests and answers into speech. Standard library only. |
-| `helper/voice_page.html` | The Edge page: microphone, speaker, voice picker, preview, thread label, log. |
+| `helper/voice_page.html` | The browser page (Edge app window on Windows): microphone, speaker, voice picker, preview, thread label, log. |
 | `helper/tests/` | Offline unit tests for the helper (no codex, no network). |
 
 ## Audio path: the browser is the WebRTC endpoint
@@ -24,7 +24,7 @@ The codex realtime API is experimental: any of this can change.
 `thread/realtime/start` accepts `transport: {type: "webrtc", sdp: <offer>}` and returns the answer
 SDP in a `thread/realtime/sdp` notification. So a client can bring its own WebRTC offer, and the
 helper simply relays the page's offer and codex's answer over `127.0.0.1`. Audio then flows between
-Edge and OpenAI directly; neither codex nor the helper touches it.
+the browser and OpenAI directly; neither codex nor the helper touches it.
 
 Using the browser gives echo cancellation, a jitter buffer and packet loss concealment for free.
 A Python WebRTC peer (aiortc) has no echo cancellation, so on speakers the model would interrupt
@@ -72,10 +72,23 @@ depend on them except for waiting on `session.started` before a preview.
 - A delegation always starts a codex turn; the helper interrupts it immediately (about 0.1 s in
   tests). Approval requests are declined, MCP elicitations are declined, and any other server request
   is refused.
-- codex is started from its native `codex.exe` (not the npm shim) and put in a Windows job object
+- On Windows, codex is started from its native `codex.exe` (not the npm shim) and put in a Windows job object
   with `KILL_ON_JOB_CLOSE`, so it dies with the helper even if the helper is killed. The helper exits
   on `POST /shutdown`, Ctrl+C/Ctrl+Break, a closed stdout (parent gone, detected by a 5 s heartbeat),
   codex exiting, or after `--idle` seconds without HTTP traffic.
+- **macOS (experimental, not tested on a real Mac).** The same helper runs on POSIX with these
+  differences: codex is started with `start_new_session=True`, so codex and its children form one
+  process group; every exit of the helper goes through `AppServer.close`, which closes codex's stdin
+  and then sends `SIGTERM` to the group and `SIGKILL` after 2 s if anything is left. A watchdog
+  process (`voice_helper.py --watch-group <pgid>`, started with `python -I` in its own session)
+  blocks on a pipe from the helper; when that pipe closes (the helper exited or was killed hard) or
+  its parent changes, it kills the group the same way. The helper also stops when it is re-parented
+  (its parent process is gone) and on `SIGINT`, `SIGTERM` or `SIGHUP`. The page is opened with
+  `open -na "<App>.app" --args --app=<url>` for the first of Google Chrome, Microsoft Edge, Brave
+  Browser or Chromium found in `/Applications` or `~/Applications`, else `open <url>` (the default
+  browser); argv is a list (no shell), the browser gets no access to the helper's stdout, and the
+  URL is never logged. Data lives in `~/Library/Application Support/claude-code-voice-mod`. Linux
+  shares these code paths but is not supported.
 
 ## Handoff -> Claude Code -> speech
 
@@ -169,7 +182,7 @@ The label goes into the page title and heading and into the voice prompt.
   `127.0.0.1:<port>` or `localhost:<port>` (no DNS rebinding); an `Origin`, when present, must be
   exactly `http://127.0.0.1:<port>` or `http://localhost:<port>`. `GET /` needs `?k=<key>`, a
   one-time key (`secrets.token_urlsafe(32)`, valid once and for 5 minutes, never logged) that the
-  helper opens Edge with; `/voice page` (`POST /reopen`) mints a new one. The page then drops it
+  helper opens the browser with; `/voice page` (`POST /reopen`) mints a new one. The page then drops it
   from the address bar (`history.replaceState`). Every other path except `/favicon.ico` needs
   `X-Voice-Token`, a random per-run token (compared in constant time). The plugin gets it from the
   `ready` line; the page gets it embedded in a `<meta>` tag. No CORS headers are sent; responses
@@ -180,8 +193,8 @@ The label goes into the page title and heading and into the voice prompt.
   for `/offer`; `413` past it), with typed fields (`400`); the socket read timeout is 10 s; at most
   8 requests are handled at once (`503`); realtime start and stop run one at a time under an
   asyncio lock, and every start or stop bumps a session generation.
-- Out of scope: other processes of the same Windows user. They can read the token and the key from
-  the plugin's or Edge's memory or command line.
+- Out of scope: other processes of the same OS user. They can read the token and the key from
+  the plugin's or the browser's memory or command line.
 
 ## Known limits
 

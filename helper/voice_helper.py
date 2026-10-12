@@ -3,9 +3,11 @@
 # dependencies = []
 # ///
 """Voice helper: talk to an OpenAI realtime model through `codex app-server`
-(ChatGPT login, no API key), with a local Edge page as the WebRTC audio endpoint.
+(ChatGPT login, no API key), with a local browser page as the WebRTC audio endpoint
+(an Edge app window on Windows; on macOS, experimental, a Chrome/Edge/Brave/Chromium app window or
+the default browser).
 
-    Edge page (mic/speaker, AEC, jitter buffer)  --SDP offer/answer via 127.0.0.1-->  this helper
+    browser page (mic/speaker, AEC, jitter buffer)  --SDP offer/answer via 127.0.0.1-->  this helper
     this helper  --stdio JSON-RPC-->  codex app-server  --(ChatGPT auth)-->  OpenAI realtime (AVAS)
     WebRTC media flows page <-> OpenAI directly; codex keeps a sideband control socket.
 
@@ -31,12 +33,12 @@ stdout protocol (one JSON object per line, read by the Claude Code plugin):
 
 HTTP (127.0.0.1 only). Every request must carry Host 127.0.0.1:<port> or localhost:<port>, and an
 Origin, when sent, must be exactly http://127.0.0.1:<port> or http://localhost:<port>. GET / needs
-?k=<one-time key> (the helper opens Edge with it; it works once, then the page strips it from the
+?k=<one-time key> (the helper opens the browser with it; it works once, then the page strips it from the
 address bar); the page it serves carries the per-run token. Every other path but /favicon.ico needs
 the header X-Voice-Token: <token>. No CORS headers are ever sent. Anything refused gets 403. Bodies
 are JSON objects within a size limit (413), typed fields (400); reads time out after 10 s; at most 8
 requests are handled at once (503). Processes of the same OS user are out of scope: they can read
-the token from the plugin's process, the page, or Edge's memory.
+the token from the plugin's process, the page, or the browser's memory.
   GET  /?k=..         the voice page        GET /health  {"ok":true,...}
   GET  /events?since=N   recent events for the page
   GET  /voices    voice list (listVoices, static fallback) + selected/active voice
@@ -49,20 +51,27 @@ the token from the plugin's process, the page, or Edge's memory.
                 Claude's answer for a request -> trimmed -> thread/realtime/appendText, so the
                 realtime model speaks a 1-2 sentence summary. Only ids of requests this helper
                 emitted in the current realtime session: unknown 403, earlier session 409
-  POST /reopen  a new one-time page link (opens Edge with --open, else a stdout page_url line)
+  POST /reopen  a new one-time page link (opens the browser with --open, else a stdout page_url line)
   POST /shutdown  exit
 
 Data (logs, settings.json with the voice and the persona, an empty working folder for codex) is
 kept outside the plugin folder: --data-dir, else $VOICE_MOD_DATA_DIR, else
-%LOCALAPPDATA%\claude-code-voice-mod (~/.local/share/claude-code-voice-mod elsewhere).
+%LOCALAPPDATA%\claude-code-voice-mod on Windows, ~/Library/Application Support/claude-code-voice-mod
+on macOS, ${XDG_STATE_HOME:-~/.local/state}/claude-code-voice-mod on other POSIX systems.
+
+Child processes: codex never outlives the helper. Windows: a job object with KILL_ON_JOB_CLOSE.
+POSIX (macOS experimental): codex runs in its own process group (start_new_session), which the
+helper terminates (SIGTERM, then SIGKILL) when it exits, and a small watchdog process (this script
+with --watch-group) kills the group when the helper's pipe to it closes, even if the helper was
+killed hard.
 The log keeps metadata only (states, errors, ids, lengths) unless --debug-log or settings.json
 "debugLog": true; log files older than 7 days, and the oldest past 20 MB, are deleted at startup.
 
 Run:  uv run --script helper/voice_helper.py [--open]          (what the plugin does)
 Self test without microphone or browser (silent aiortc peer, sends one text):
-      uv run --project helper --group selftest helper/voice_helper.py --selftest-text "..."
+      uv run --project helper --group selftest python helper/voice_helper.py --selftest-text "..."
 Handoff self test (text that should be handed off, then a fake answer is fed back):
-      uv run --project helper --group selftest helper/voice_helper.py --selftest-handoff "..." \
+      uv run --project helper --group selftest python helper/voice_helper.py --selftest-handoff "..." \
              [--selftest-answer "..."]
 """
 
@@ -91,14 +100,29 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PAGE_PATH = os.path.join(HERE, "voice_page.html")
 
 
-def default_data_dir() -> str:
+APP_DIR_NAME = "claude-code-voice-mod"
+
+
+def default_data_dir(platform: str | None = None, environ=None) -> str:
     """Per-user folder for logs and settings, outside the plugin folder (which Claude Code may
-    watch and hot-reload, and which a plugin update may replace)."""
-    env = os.environ.get("VOICE_MOD_DATA_DIR")
+    watch and hot-reload, and which a plugin update may replace).
+
+    $VOICE_MOD_DATA_DIR wins everywhere. Windows: %LOCALAPPDATA%. macOS (experimental):
+    ~/Library/Application Support. Other POSIX: $XDG_STATE_HOME (if absolute), else ~/.local/state."""
+    platform = sys.platform if platform is None else platform
+    environ = os.environ if environ is None else environ
+    env = environ.get("VOICE_MOD_DATA_DIR")
     if env:
         return os.path.abspath(os.path.expanduser(env))
-    base = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), ".local", "share")
-    return os.path.join(base, "claude-code-voice-mod")
+    home = os.path.expanduser("~")
+    if platform == "win32":
+        base = environ.get("LOCALAPPDATA") or os.path.join(home, ".local", "share")
+    elif platform == "darwin":
+        base = os.path.join(home, "Library", "Application Support")
+    else:
+        xdg = environ.get("XDG_STATE_HOME") or ""
+        base = xdg if os.path.isabs(xdg) else os.path.join(home, ".local", "state")
+    return os.path.join(base, APP_DIR_NAME)
 
 
 def set_data_dir(path: str):
@@ -854,6 +878,124 @@ class _JobKiller:
         return ok
 
 
+# ---------------------------------------------------------------- POSIX process group (no orphans)
+#
+# macOS support is experimental: implemented and unit-tested with mocks, not run on a real Mac.
+# Linux shares this path but is not a supported platform.
+
+GROUP_KILL_GRACE = 2.0  # seconds between SIGTERM and SIGKILL for codex's process group
+
+
+def child_spawn_options(name: str | None = None) -> dict:
+    """Extra keyword arguments for starting codex. Windows: no console window (the job object
+    owns the process). POSIX: a new session, so codex and its children form one process group
+    that can be signalled as a whole and does not get the terminal's Ctrl+C."""
+    if (os.name if name is None else name) == "nt":
+        return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+    return {"start_new_session": True}
+
+
+def kill_process_group(pgid: int, grace: float = GROUP_KILL_GRACE, killpg=None, sleep=time.sleep,
+                       clock=time.monotonic) -> str:
+    """SIGTERM to the whole group, then SIGKILL if anything is still in it after `grace` seconds.
+    Returns "gone" (nothing was there), "terminated", "killed" or "denied"."""
+    killpg = killpg or getattr(os, "killpg")
+    sigkill = getattr(signal, "SIGKILL", 9)
+    try:
+        killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return "gone"
+    except PermissionError:
+        return "denied"
+    deadline = clock() + grace
+    while clock() < deadline:
+        try:
+            killpg(pgid, 0)  # anyone left in the group?
+        except ProcessLookupError:
+            return "terminated"
+        except PermissionError:
+            return "denied"
+        sleep(0.05)
+    try:
+        killpg(pgid, sigkill)
+    except ProcessLookupError:
+        return "terminated"
+    except PermissionError:
+        return "denied"
+    return "killed"
+
+
+def watchdog_argv(pgid: int, python: str | None = None, script: str | None = None) -> list[str]:
+    """The watchdog is this script in a separate interpreter (-I: no site, no cwd on sys.path)."""
+    return [python or sys.executable, "-I", script or os.path.abspath(__file__), "--watch-group", str(pgid)]
+
+
+def watch_group(pgid: int, stdin=None, parent: int | None = None, getppid=os.getppid,
+                kill=kill_process_group, poll: float = 1.0) -> str:
+    """Body of the watchdog process: blocks until the helper's end of the pipe on our stdin
+    closes (the helper exited, however it died) or our parent changes (re-parented to launchd
+    or init), then kills codex's process group. Returns what kill_process_group returned."""
+    stdin = stdin if stdin is not None else sys.stdin.buffer
+    parent = getppid() if parent is None else parent
+    done = threading.Event()
+
+    def read_until_eof():
+        try:
+            while stdin.read(1):
+                pass
+        except (OSError, ValueError):
+            pass
+        done.set()
+
+    threading.Thread(target=read_until_eof, daemon=True).start()
+    while not done.wait(poll):
+        if getppid() != parent:
+            break
+    return kill(pgid)
+
+
+class _PosixGroup:
+    """POSIX counterpart of _JobKiller: codex was started with start_new_session=True, so its pid
+    is its process group id. add() starts the watchdog for that group; close() terminates the
+    group (every exit path of the helper goes through AppServer.close) and lets the watchdog go."""
+
+    def __init__(self, popen=subprocess.Popen, kill=kill_process_group):
+        self._popen, self._kill = popen, kill
+        self.pgid: int | None = None
+        self.watchdog = None
+
+    def add(self, pid: int) -> bool:
+        self.pgid = pid
+        try:
+            self.watchdog = self._popen(watchdog_argv(pid), stdin=subprocess.PIPE,
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                        close_fds=True, start_new_session=True)
+        except OSError as e:
+            LOG.write("WARN", f"codex watchdog not started: {type(e).__name__}")
+            return False
+        return True
+
+    def close(self) -> str:
+        """Terminates codex's group and stops the watchdog. Blocking (up to a few seconds)."""
+        result = self._kill(self.pgid) if self.pgid else "none"
+        wd, self.watchdog = self.watchdog, None
+        if wd is not None:
+            try:
+                wd.stdin.close()  # the watchdog sees EOF, finds the group gone and exits
+            except Exception:
+                pass
+            try:
+                wd.wait(GROUP_KILL_GRACE + 3)
+            except Exception:
+                pass
+        return result
+
+
+def child_guard(name: str | None = None):
+    """What keeps codex from outliving the helper on this platform."""
+    return _JobKiller() if (os.name if name is None else name) == "nt" else _PosixGroup()
+
+
 def find_codex_exe(explicit: str | None) -> tuple[str, dict]:
     """Prefer the native codex.exe (so the job object really owns it) over the npm .cmd shim."""
     env = dict(os.environ)
@@ -923,7 +1065,7 @@ class AppServer:
         self.proc = await asyncio.create_subprocess_exec(
             *args, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE, cwd=CODEX_CWD, env=env, limit=32 * 1024 * 1024,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            **child_spawn_options())
         LOG.write("SPAWN", f"codex app-server pid={self.proc.pid} job={self.jobs.add(self.proc.pid)}")
         self._tasks = [asyncio.create_task(self._read_stdout()), asyncio.create_task(self._read_stderr())]
 
@@ -1235,7 +1377,7 @@ class AppServer:
     # -- high level
     async def handshake(self):
         init = await self.request("initialize", {
-            "clientInfo": {"name": "claude_voice_mod", "title": "Claude Voice Mod", "version": "0.3.1"},
+            "clientInfo": {"name": "claude_voice_mod", "title": "Claude Voice Mod", "version": "0.4.0"},
             "capabilities": {"experimentalApi": True, "requestAttestation": False},
         }, timeout=60)
         await self.notify("initialized")
@@ -1429,8 +1571,18 @@ class AppServer:
             await asyncio.wait_for(self.proc.wait(), 3)
         except asyncio.TimeoutError:
             LOG.write("INFO", "codex did not exit on stdin close; killing")
+            if not isinstance(self.jobs, _PosixGroup):  # Windows: the job object owns the rest
+                try:
+                    self.proc.kill()
+                    await asyncio.wait_for(self.proc.wait(), 3)
+                except Exception:
+                    pass
+        if isinstance(self.jobs, _PosixGroup):
+            # The whole group (codex and anything it started): SIGTERM, then SIGKILL. Also run
+            # when codex itself exited, so no child of it is left behind.
+            result = await asyncio.to_thread(self.jobs.close)
+            LOG.write("INFO", f"codex process group: {result}")
             try:
-                self.proc.kill()
                 await asyncio.wait_for(self.proc.wait(), 3)
             except Exception:
                 pass
@@ -1804,14 +1956,56 @@ PAGE_REFUSED = (
     "<!doctype html><meta charset=utf-8><title>Voice Mod</title>"
     "<body style='font:15px system-ui,sans-serif;margin:2em'>"
     "<h1>Voice Mod: this link is used up</h1><p>The voice page opens only through the one-time link "
-    "the helper starts Edge with. Run <code>/voice page</code> in Claude Code to open it again.</p>"
+    "the helper opens the browser with. Run <code>/voice page</code> in Claude Code to open it again.</p>"
 ).encode("utf-8")
 
+# macOS (experimental): Chromium-based browsers that take --app=<url> (an app-style window), in
+# order of preference. Without one, the default browser opens the page in a normal tab (Safari
+# works for WebRTC but has no app mode).
+MAC_APP_BROWSERS = ("Google Chrome", "Microsoft Edge", "Brave Browser", "Chromium")
+# Other POSIX systems (not supported, best effort): executables that take --app=<url>.
+POSIX_APP_BROWSERS = ("google-chrome", "google-chrome-stable", "microsoft-edge", "microsoft-edge-stable",
+                      "brave-browser", "chromium", "chromium-browser")
 
-def open_page(url: str):
-    """Opens the voice page in an Edge app window."""
-    subprocess.Popen(["cmd", "/c", "start", "", "msedge", f"--app={url}"],
-                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+def page_command(url: str, platform: str | None = None, isdir=None, which=None,
+                 home: str | None = None) -> list[str]:
+    """argv that opens the voice page (never run through a shell). The URL carries the one-time
+    key: it is never logged."""
+    platform = sys.platform if platform is None else platform
+    isdir, which = isdir or os.path.isdir, which or shutil.which
+    if platform == "win32":
+        return ["cmd", "/c", "start", "", "msedge", f"--app={url}"]
+    if platform == "darwin":
+        home = os.path.expanduser("~") if home is None else home
+        for app in MAC_APP_BROWSERS:
+            for root in ("/Applications", os.path.join(home, "Applications")):
+                path = f"{root}/{app}.app"
+                if isdir(path):
+                    return ["open", "-na", path, "--args", f"--app={url}"]
+        return ["open", url]
+    for name in POSIX_APP_BROWSERS:
+        exe = which(name)
+        if exe:
+            return [exe, f"--app={url}"]
+    return ["xdg-open", url]
+
+
+def open_page(url: str, platform: str | None = None, popen=subprocess.Popen):
+    """Opens the voice page: an Edge app window on Windows; on macOS (experimental) an app window
+    of Chrome, Edge, Brave or Chromium if one is installed, else the default browser."""
+    platform = sys.platform if platform is None else platform
+    argv = page_command(url, platform)
+    if platform == "win32":
+        popen(argv, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return
+    # Own session (not killed with the helper), and nothing on our stdout: it is the JSON protocol.
+    try:
+        popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+              close_fds=True, start_new_session=True)
+    except OSError as e:
+        LOG.write("ERROR", f"could not open the voice page with {os.path.basename(argv[0])}: "
+                           f"{type(e).__name__} errno={getattr(e, 'errno', None)}")
 
 
 # ---------------------------------------------------------------- headless self test (no mic, no browser)
@@ -2043,6 +2237,33 @@ async def selftest_handoff(app: AppServer, args, voice: str | None):
 
 # ---------------------------------------------------------------- main
 
+def stop_signals(name: str | None = None) -> list:
+    """Signals that end the helper cleanly. Windows: Ctrl+C, Ctrl+Break, SIGTERM (unchanged).
+    POSIX: SIGINT, SIGTERM and SIGHUP (terminal or parent session closed)."""
+    if (os.name if name is None else name) == "nt":
+        sigs = (signal.SIGINT, getattr(signal, "SIGBREAK", None), signal.SIGTERM)
+    else:
+        sigs = (signal.SIGINT, signal.SIGTERM, getattr(signal, "SIGHUP", None))
+    return [s for s in sigs if s is not None]
+
+
+def install_signal_handlers(handler, name: str | None = None, register=None) -> list:
+    register = register or signal.signal
+    sigs = stop_signals(name)
+    for sig in sigs:
+        register(sig, handler)
+    return sigs
+
+
+def parent_gone(parent_pid: int, name: str | None = None, getppid=None) -> bool:
+    """POSIX: re-parented (to launchd/init) means the process that started us is gone, even when
+    our stdout pipe is still held open by someone else. Windows keeps its existing checks only
+    (a closed stdout at the next heartbeat)."""
+    if (os.name if name is None else name) == "nt":
+        return False
+    return (getppid or os.getppid)() != parent_pid
+
+
 async def amain(args):
     global _stop_cb, TOKEN
     TOKEN = secrets.token_urlsafe(32)
@@ -2060,12 +2281,11 @@ async def amain(args):
     def on_signal(signum, _frame):
         _stop_cb(f"signal {signum}")
 
-    for sig in (signal.SIGINT, getattr(signal, "SIGBREAK", None), signal.SIGTERM):
-        if sig is not None:
-            signal.signal(sig, on_signal)
+    install_signal_handlers(on_signal)
+    parent_pid = os.getppid()
 
     exe, env = find_codex_exe(args.codex)
-    app = AppServer(exe, env, _JobKiller(), interrupt_turns=not args.no_interrupt)
+    app = AppServer(exe, env, child_guard(), interrupt_turns=not args.no_interrupt)
     server = None
     try:
         await app.start()
@@ -2094,6 +2314,8 @@ async def amain(args):
                     pass
                 if app.exited.is_set():
                     stop("codex app-server exited")
+                elif parent_gone(parent_pid):
+                    stop("parent gone")
                 elif time.monotonic() - bridge.last_activity > args.idle:
                     stop(f"idle {args.idle}s")
                 else:
@@ -2136,17 +2358,19 @@ def main():
     global LOG
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--port", type=int, default=0, help="HTTP port on 127.0.0.1 (0 = any free port)")
-    parser.add_argument("--open", action="store_true", help="open the voice page in Edge (app window)")
+    parser.add_argument("--open", action="store_true", help="open the voice page (Windows: Edge app window; macOS: "
+                             "Chrome/Edge/Brave/Chromium app window, else the default browser)")
     parser.add_argument("--version", choices=["v1", "v3"], default="v3",
                         help="realtime version: v3 = gpt-live-1-codex (default), v1 = gpt-realtime-1.5")
     parser.add_argument("--voice", default=None,
                         help="voice name, e.g. juniper, maple, spruce (overrides settings.json)")
     parser.add_argument("--data-dir", default=None,
                         help="folder for logs and settings.json (default: $VOICE_MOD_DATA_DIR, else "
-                             "%%LOCALAPPDATA%%\\claude-code-voice-mod)")
+                             "%%LOCALAPPDATA%%\\claude-code-voice-mod on Windows, ~/Library/Application "
+                             "Support/claude-code-voice-mod on macOS)")
     parser.add_argument("--label", default="",
                         help="name of the Claude Code thread this page talks to (window title, voice prompt)")
-    parser.add_argument("--codex", default=None, help="path to codex.exe (default: from PATH)")
+    parser.add_argument("--codex", default=None, help="path to codex (default: from PATH)")
     parser.add_argument("--idle", type=int, default=1800, help="exit after N seconds without HTTP requests")
     parser.add_argument("--no-interrupt", action="store_true",
                         help="do not interrupt Codex turns started by handoffs (debug only)")
@@ -2165,7 +2389,13 @@ def main():
     parser.add_argument("--debug-log", action="store_true",
                         help="also log conversation text (transcripts, requests; redacted). Default: metadata "
                              "only. Same as \"debugLog\": true in settings.json")
+    parser.add_argument("--watch-group", type=int, default=None, help=argparse.SUPPRESS)  # POSIX watchdog
     args = parser.parse_args()
+    if args.watch_group is not None:
+        # The watchdog process (see _PosixGroup): no log, no data dir; it kills codex's process
+        # group when the helper's pipe to it closes.
+        watch_group(args.watch_group)
+        return
     global LABEL, PERSONA, DEBUG_LOG
     if args.data_dir:
         set_data_dir(args.data_dir)

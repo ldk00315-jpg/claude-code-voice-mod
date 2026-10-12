@@ -1,13 +1,13 @@
 {
   "name": "claude-code-voice-mod",
   "owner": { "name": "ldk00315-jpg" },
-  "description": "Voice front desk for Claude Code on Windows",
+  "description": "Voice front desk for Claude Code on Windows (macOS experimental)",
   "plugins": [
     {
       "name": "voice",
       "source": "./",
-      "version": "0.3.1",
-      "description": "Voice front desk for Claude Code on Windows (codex realtime + ChatGPT login)"
+      "version": "0.4.0",
+      "description": "Voice front desk for Claude Code on Windows, macOS experimental (codex realtime + ChatGPT login)"
     }
   ]
 }

@@ -1,7 +1,7 @@
 // voice: talk to Claude Code through the codex realtime voice helper.
 //
 //   /voice on       spawn the helper (uv run --script <plugin>/helper/voice_helper.py --open):
-//                   Edge page = mic/speaker,
+//                   browser page (Edge app window on Windows) = mic/speaker,
 //                   codex app-server = OpenAI realtime (ChatGPT login)
 //   helper "request" line (a handoff from the realtime model)
 //                   -> queued; one at a time -> $.prompt.submit("[voice] ...")
@@ -458,7 +458,7 @@ export function loadVoiceMod(on: On) {
       if (m.child) return { text: `voice: already ${m.phase}` }
       const label = await threadLabel($, rest.join(' '))
       start(m, $, label)
-      return { text: `voice: starting the helper as [${label}]; the voice page opens in Edge. Press Start there and talk.` }
+      return { text: `voice: starting the helper as [${label}]; the voice page opens in your browser (Edge on Windows). Press Start there and talk.` }
     }
     if (arg === 'off') {
       if (!m.child) return { text: 'voice: not running' }

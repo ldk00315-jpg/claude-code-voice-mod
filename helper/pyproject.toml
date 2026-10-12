@@ -1,7 +1,7 @@
 [project]
 name = "claude-voice-helper"
-version = "0.3.1"
-description = "Voice helper for the Claude Code voice plugin: codex app-server realtime (ChatGPT auth, WebRTC) with a local Edge page as the audio endpoint"
+version = "0.4.0"
+description = "Voice helper for the Claude Code voice plugin: codex app-server realtime (ChatGPT auth, WebRTC) with a local browser page (Edge on Windows) as the audio endpoint"
 requires-python = ">=3.11,<3.14"
 # The helper itself is stdlib only (the browser does the audio).
 dependencies = []

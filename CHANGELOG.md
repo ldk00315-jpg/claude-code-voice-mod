@@ -1,6 +1,49 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 (2026-10-12)
+
+Experimental macOS support and an install guide that Claude Code can follow. The Windows behaviour
+is unchanged. The new macOS code paths were added after the security-reviewed `v0.3.1` and have
+**not been security-reviewed or tested on a real Mac** (unit tests with mocks only, run on Windows).
+
+- **macOS (experimental).** The helper opens the voice page in an app window of Google Chrome,
+  Microsoft Edge, Brave or Chromium when one is installed (`open -na <App> --args --app=<url>`),
+  else in the default browser (`open <url>`); argv only, no shell, the URL (one-time key) never
+  logged, the browser detached and kept off the helper's stdout. codex runs in its own process
+  group (`start_new_session`); the helper sends `SIGTERM` and then `SIGKILL` to the group on every
+  exit, and a watchdog process (`--watch-group`) kills the group if the helper dies without
+  cleaning up. The helper stops on `SIGINT`/`SIGTERM`/`SIGHUP` and when its parent process is
+  gone. Data folder: `~/Library/Application Support/claude-code-voice-mod` (other POSIX systems:
+  `${XDG_STATE_HOME:-~/.local/state}/claude-code-voice-mod`; `VOICE_MOD_DATA_DIR` and `--data-dir`
+  still win). Linux shares these code paths but is not supported.
+- Unit tests for the platform branches (`helper/tests/test_platforms.py`): data folders, browser
+  commands for each case including the fallback, process-group kill, watchdog, signals; the Windows
+  launch command, spawn flags and signals are pinned to their previous values.
+- **README (en/ja): "Install with Claude Code".** A prompt to paste into Claude Code, numbered install
+  steps an agent can follow (prerequisite checks with exact commands per OS, install, reload,
+  first run) and rules for the agent: never handle credentials (`codex login` is the user's),
+  ask before any change to settings or environment variables, never widen auto-approval.
+- **Install commands verified** against the Claude Code docs and `claude plugin install --help`
+  (2.1.295): `/plugin install voice --marketplace ldk00315-jpg/claude-code-voice-mod` (in a session,
+  2.1.275+) was already right; the README now also gives the shell forms
+  `claude plugin marketplace add ldk00315-jpg/claude-code-voice-mod` +
+  `claude plugin install voice@claude-code-voice-mod`, and
+  `claude plugin install voice --marketplace ...` (2.1.292+).
+- README: requirements per OS, macOS notes (browser, microphone permission, data folder, Homebrew),
+  macOS rows in Troubleshooting; the "Security reviews" section says what 0.4.0 adds outside the
+  reviews.
+- ChatGPT plans, tested 2026-10-12 with codex-cli 0.160.0: Pro works, **Free does not** (the
+  realtime endpoint returns `404 Not Found`), Go/Plus untested. New README section "Check whether
+  your ChatGPT plan works" (self test, how to read its output, testing another account with a
+  separate `CODEX_HOME`, the "State mismatch" fix).
+- Self-test command fixed: `uv run --project helper --group selftest python helper/voice_helper.py`
+  (without `python`, uv uses the script's inline metadata, ignores `--group selftest` and the test
+  fails with `No module named 'aiortc'`).
+- Texts that named Edge only (the `/voice on` reply, the used-up link page, helper help) are
+  platform-neutral now. Version 0.4.0 in the plugin, the marketplace, the helper project and
+  `clientInfo`.
+
+## Documentation after review 4 (unreleased on its own, included in 0.4.0)
 
 Documentation after the fourth security review of 0.3.1 (commit deeac60); no behaviour change.
 
