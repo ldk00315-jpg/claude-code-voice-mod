@@ -21,7 +21,7 @@ const MARK_AT_LINE_START = /(^|\n)\[voice\] /
 /**
  * Whether a turn's text carries the voice marker: a line starting with MARK, and the NOTICE block.
  * Checked at turn.start independently of the job queue, so a voice prompt that is still queued
- * in Claude Code after its job timed out, or after `/voice off`, is still guarded when it runs.
+ * in Claude Code after its job timed out, or after `/talk off`, is still guarded when it runs.
  * Fail-safe by design: a typed prompt that happens to contain both (for example a pasted voice
  * prompt) is guarded too; retype the request without the marker to run it unguarded.
  */

@@ -1,15 +1,15 @@
 // voice: talk to Claude Code through the codex realtime voice helper.
 //
-//   /voice on       spawn the helper (uv run --script <plugin>/helper/voice_helper.py --open):
+//   /talk on       spawn the helper (uv run --script <plugin>/helper/voice_helper.py --open):
 //                   browser page (Edge app window on Windows) = mic/speaker,
 //                   codex app-server = OpenAI realtime (ChatGPT login)
 //   helper "request" line (a handoff from the realtime model)
 //                   -> queued; one at a time -> $.prompt.submit("[voice] ...")
 //   turn.complete of that turn (main loop) -> POST http://127.0.0.1:PORT/answer {id, answer, status}
 //                   -> the helper hands it to the realtime model, which says a 1-2 sentence summary
-//   /voice off      ask the helper to exit, then end the stream (kills it)
-//   /voice page     open the voice page again (a fresh one-time link)
-//   /voice status   phase, queue, port
+//   /talk off      ask the helper to exit, then end the stream (kills it)
+//   /talk page     open the voice page again (a fresh one-time link)
+//   /talk status   phase, queue, port
 //
 // Voice-origin guard: while a voice turn runs (and in every subagent it started), tool.call
 // denies destructive deletes, git push, gh writes, publishes, sends, browser/computer use,
@@ -24,7 +24,7 @@ import type { GuardState } from '../types'
 import { VoiceScope, checkVoiceToolCall, denyMessage } from './guard.ts'
 import { MARK, isVoicePrompt, promptFor } from './prompt.ts'
 
-const NAME = 'voice'
+const NAME = 'talk'
 const UNSAVED = 'guard NOT saved (retrying)'
 const UNSAVED_TOAST = 'voice: the voice guard could not be saved; a reload of this Mod now may drop it. Retrying.'
 const GUARD = { plugin: 'voice', key: 'guard' } as const
@@ -40,12 +40,12 @@ export function helperArgv(pluginRoot: string, label: string): string[] {
   return ['uv', 'run', '--script', `${dir}/voice_helper.py`, '--open', '--label', label]
 }
 
-/** Where this thread's name is kept across /voice off, app restarts and resumes. */
+/** Where this thread's name is kept across /talk off, app restarts and resumes. */
 async function labelKey($: EngineInterface): Promise<string> {
   return `label:${await $.session.id()}`
 }
 
-/** Remembers the thread's name (given with /voice on, or changed on the voice page). */
+/** Remembers the thread's name (given with /talk on, or changed on the voice page). */
 async function saveLabel($: EngineInterface, label: string) {
   await $.store.set(await labelKey($), label.slice(0, 60))
 }
@@ -92,7 +92,7 @@ type Load = {
   jobs: Job[]
   scope: VoiceScope
   // Every prompt text this module submitted: a second signal, besides the marker, that a
-  // starting turn is a voice turn, even after its job timed out or `/voice off` dropped the queue.
+  // starting turn is a voice turn, even after its job timed out or `/talk off` dropped the queue.
   submittedTexts: string[]
   restored: Promise<void> | null
   savedRevision: number // the scope revision the host holds (advanced only by a landed write)
@@ -466,7 +466,7 @@ export function loadVoiceMod(on: On) {
       return { text: 'voice: stopped' }
     }
     if (arg === 'page') {
-      if (!m.child || !m.port) return { text: 'voice: not running (use /voice on)' }
+      if (!m.child || !m.port) return { text: 'voice: not running (use /talk on)' }
       try {
         const res = await helperPost(m, $, '/reopen')
         return { text: res.ok ? 'voice: opening the voice page again' : `voice: could not reopen the page (HTTP ${res.status})` }
@@ -494,7 +494,7 @@ export function loadVoiceMod(on: On) {
   // turn.start fires for the main loop only (a subagent's run raises none).
   // Whether the turn is guarded does not depend on the job queue: the voice marker
   // (prompt.ts isVoicePrompt) or any text this module ever submitted is enough, so a voice
-  // prompt still queued in Claude Code after a timeout or `/voice off` runs guarded.
+  // prompt still queued in Claude Code after a timeout or `/talk off` runs guarded.
   on('turn.start', async ($, e, next) => {
     await restore(m, $)
     const job = m.jobs.find(

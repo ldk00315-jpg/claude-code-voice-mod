@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.1 (2026-10-16)
+
+- **The command is now `/talk`** (`/talk on [name]`, `/talk off`, `/talk status`, `/talk page`).
+  Claude Code has a built-in `/voice` ("Toggle voice mode", available only on claude.ai). From
+  Claude Code 2.1.299 the built-in takes precedence, so `/voice on` answered
+  "/voice isn't available in this environment" and never reached this plugin. The plugin name
+  (`voice`) and the install commands are unchanged.
+
 ## 0.4.0 (2026-10-12)
 
 Experimental macOS support and an install guide that Claude Code can follow. The Windows behaviour

@@ -1377,7 +1377,7 @@ class AppServer:
     # -- high level
     async def handshake(self):
         init = await self.request("initialize", {
-            "clientInfo": {"name": "claude_voice_mod", "title": "Claude Voice Mod", "version": "0.4.0"},
+            "clientInfo": {"name": "claude_voice_mod", "title": "Claude Voice Mod", "version": "0.4.1"},
             "capabilities": {"experimentalApi": True, "requestAttestation": False},
         }, timeout=60)
         await self.notify("initialized")
@@ -1956,7 +1956,7 @@ PAGE_REFUSED = (
     "<!doctype html><meta charset=utf-8><title>Voice Mod</title>"
     "<body style='font:15px system-ui,sans-serif;margin:2em'>"
     "<h1>Voice Mod: this link is used up</h1><p>The voice page opens only through the one-time link "
-    "the helper opens the browser with. Run <code>/voice page</code> in Claude Code to open it again.</p>"
+    "the helper opens the browser with. Run <code>/talk page</code> in Claude Code to open it again.</p>"
 ).encode("utf-8")
 
 # macOS (experimental): Chromium-based browsers that take --app=<url> (an app-style window), in

@@ -82,7 +82,7 @@ function outcome(r: unknown): string {
 test('requests run one at a time; answers go back; the guard covers voice turns only', async ($, on) => {
   const eng = engine(on, READY + req('r1', 'list the files in this folder') + req('r2', 'check the latest log'))
 
-  const ran = await $.command.run({ command: 'voice', args: 'on', ...TYPED })
+  const ran = await $.command.run({ command: 'talk', args: 'on', ...TYPED })
   expect(ran.text).toContain('[demo-project・0a1b]') // no name given: folder + session id head
   // The helper is found inside this plugin's own folder, never at a fixed path.
   const argv = eng.spawned[0] ?? []
@@ -136,9 +136,9 @@ test('requests run one at a time; answers go back; the guard covers voice turns 
   expect(outcome(await $.tool.call({ tool: 'Bash', command: 'rm -rf build' }))).toBe('reached core')
   await $.turn.complete({ ...DONE, answer: 'ok', turnId: 'U2' })
 
-  const status = await $.command.run({ command: 'voice', args: 'status', ...TYPED })
+  const status = await $.command.run({ command: 'talk', args: 'status', ...TYPED })
   expect(status.text).toContain('port=4321')
-  const off = await $.command.run({ command: 'voice', args: 'off', ...TYPED })
+  const off = await $.command.run({ command: 'talk', args: 'off', ...TYPED })
   expect(off.text).toBe('voice: stopped')
   expect(eng.posts[2]?.url).toBe('http://127.0.0.1:4321/shutdown')
   expect(eng.posts[2]?.init?.headers?.['X-Voice-Token']).toBe(TOKEN)
@@ -148,7 +148,7 @@ test('requests run one at a time; answers go back; the guard covers voice turns 
 test('a request that takes too long is answered "timeout", and the late answer still goes back', async ($, on) => {
   const clock = mock.clock(on)
   const eng = engine(on, READY + req('r1', 'run a long investigation'))
-  await $.command.run({ command: 'voice', args: 'on', ...TYPED })
+  await $.command.run({ command: 'talk', args: 'on', ...TYPED })
   await eng.nextSubmit(1)
   await $.turn.start({ text: eng.submitted[0] ?? '', turnId: 'V1' })
 
@@ -162,14 +162,14 @@ test('a request that takes too long is answered "timeout", and the late answer s
   expect(eng.posts.length).toBe(2)
   expect(bodyOf(eng.posts, 1)).toMatchObject({ id: 'r1', status: 'late', answer: 'Finally done.' })
 
-  await $.command.run({ command: 'voice', args: 'off', ...TYPED })
+  await $.command.run({ command: 'talk', args: 'off', ...TYPED })
   eng.release()
 })
 
 test('a voice prompt whose job timed out before its turn started is still guarded', async ($, on) => {
   const clock = mock.clock(on)
   const eng = engine(on, READY + req('r1', 'clean up the build folder'))
-  await $.command.run({ command: 'voice', args: 'on', ...TYPED })
+  await $.command.run({ command: 'talk', args: 'on', ...TYPED })
   await eng.nextSubmit(1)
   // The session is busy with a long typed turn; the voice prompt waits in Claude Code's queue.
   await clock.advance(10 * 60 * 1000 + 1)
@@ -187,15 +187,15 @@ test('a voice prompt whose job timed out before its turn started is still guarde
   expect(outcome(await $.tool.call({ tool: 'Bash', command: 'git push origin main' }))).toBe('reached core')
   await $.turn.complete({ ...DONE, answer: 'ok', turnId: 'U1' })
 
-  await $.command.run({ command: 'voice', args: 'off', ...TYPED })
+  await $.command.run({ command: 'talk', args: 'off', ...TYPED })
   eng.release()
 })
 
-test('a voice prompt still queued after /voice off is guarded; its answer is dropped', async ($, on) => {
+test('a voice prompt still queued after /talk off is guarded; its answer is dropped', async ($, on) => {
   const eng = engine(on, READY + req('r1', 'delete the old logs'))
-  await $.command.run({ command: 'voice', args: 'on', ...TYPED })
+  await $.command.run({ command: 'talk', args: 'on', ...TYPED })
   await eng.nextSubmit(1)
-  const off = await $.command.run({ command: 'voice', args: 'off', ...TYPED })
+  const off = await $.command.run({ command: 'talk', args: 'off', ...TYPED })
   expect(off.text).toBe('voice: stopped')
   const before = eng.posts.length // the /shutdown call
 

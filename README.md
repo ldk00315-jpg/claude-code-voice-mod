@@ -46,14 +46,14 @@ Claude Code session. When Claude finishes, the voice reads you a one or two sent
 >   something that reliably prevents dangerous actions.
 > - **Do not use it with data that must not leave your machine**, nor in folders that contain
 >   secrets, credentials, or anything you would not want read aloud or sent to OpenAI (turning
->   logging off does not change what is sent). Use a headset, and turn it off (`/voice off`) when
+>   logging off does not change what is sent). Use a headset, and turn it off (`/talk off`) when
 >   you are not using it.
 >
 > The software is provided "as is", without warranty of any kind (see [LICENSE](LICENSE)).
 
 ## Demo flow
 
-1. In Claude Code, type `/voice on docs-site`. A browser app window ("[docs-site] Voice Mod") opens
+1. In Claude Code, type `/talk on docs-site`. A browser app window ("[docs-site] Voice Mod") opens
    (Edge on Windows; on macOS Chrome, Edge, Brave or Chromium, else your default browser).
 2. Press **Start (uses the microphone)** and talk: "Hi!" - the voice answers by itself.
 3. Say "Check which tests are failing in this project and tell me why." The voice says a short
@@ -62,7 +62,7 @@ Claude Code session. When Claude finishes, the voice reads you a one or two sent
    `voice: Claude working on "..."`. Claude works as usual (you can watch and approve prompts).
 5. When the turn ends, the answer goes back to the voice, which speaks a one or two sentence summary.
    The full answer stays on screen.
-6. `/voice off` when you are done.
+6. `/talk off` when you are done.
 
 ## Architecture
 
@@ -103,7 +103,7 @@ Claude Code session. When Claude finishes, the voice reads you a one or two sent
   This checks what codex reports; it is not a sandbox around codex.
 - The local HTTP server accepts only `Host`/`Origin` of its own `127.0.0.1:<port>`. The page is
   served only through a **one-time link** (`/?k=...`) that the helper opens the browser with; the page
-  removes it from the address bar, and `/voice page` opens a fresh one. Every other call needs a
+  removes it from the address bar, and `/talk page` opens a fresh one. Every other call needs a
   random per-run token (`X-Voice-Token`) that the plugin gets from the helper's `ready` line and
   the page carries. No CORS headers are sent. Answers are accepted only for requests the helper
   itself sent in the current realtime session. Bodies are size-limited and type-checked, reads time
@@ -142,7 +142,7 @@ Claude Code session. When Claude finishes, the voice reads you a one or two sent
 - Install `uv` and `codex` with Homebrew (`brew install uv`, `brew install --cask codex`) or their
   official installers (uv: `curl -LsSf https://astral.sh/uv/install.sh | sh`; codex:
   `npm install -g @openai/codex`). They must be on the `PATH` that Claude Code itself sees: if you
-  start the desktop app from the Dock and `/voice on` says the helper exited at once, start Claude
+  start the desktop app from the Dock and `/talk on` says the helper exited at once, start Claude
   Code from a Terminal (`claude`) instead.
 - Microphone permission: the first time you press **Start**, the browser asks for the microphone;
   macOS may also ask. If it was denied, allow it in **System Settings → Privacy & Security →
@@ -179,7 +179,7 @@ it asks to run, and start a new session (or run `/reload-plugins`) at the end.
 > - **Do not widen auto-approval.** Do not add `permissions.allow` rules, switch to a bypass or
 >   auto-accept permission mode, or use `--dangerously-skip-permissions`. The voice guard is only an
 >   extra net on top of Claude Code's normal permission prompts.
-> - Do not run `/voice on` or open the microphone for the user; tell them how (step 5).
+> - Do not run `/talk on` or open the microphone for the user; tell them how (step 5).
 > - At the end, report what you checked and what you changed.
 
 **1. Check the operating system.** Windows 10/11, or macOS (experimental: tell the user it has not
@@ -243,21 +243,24 @@ an installed copy works as well.
 that is already open, run `/reload-plugins`. An agent cannot restart its own session: tell the user
 to start a new session (desktop app: a new session; after changing an environment variable, restart
 the app). Check with `claude plugin list` (shows `voice@claude-code-voice-mod`) and, in a session,
-`/voice status`, which should answer `voice: stopped`.
+`/talk status`, which should answer `voice: stopped`.
 
-**5. First run (the user does this).** In a Claude Code session, type `/voice on`. The voice page
+**5. First run (the user does this).** In a Claude Code session, type `/talk on`. The voice page
 opens; press **Start (uses the microphone)** and allow the microphone (macOS: also System Settings →
 Privacy & Security → Microphone for that browser). Say "Hello" - the voice should answer. Type
-`/voice off` when done. If something fails, see [Troubleshooting](#troubleshooting).
+`/talk off` when done. If something fails, see [Troubleshooting](#troubleshooting).
 
 ## Usage
 
+> The command is `/talk` (until 0.4.0 it was `/voice`). Claude Code's own built-in `/voice` takes
+> precedence from Claude Code 2.1.299 and answers "/voice isn't available in this environment".
+
 | Command | What it does |
 | --- | --- |
-| `/voice on [name]` | Starts the helper and opens the voice page. `name` is the thread label (optional). |
-| `/voice off` | Stops the helper (and codex). Also happens when the session ends. |
-| `/voice page` | Opens the voice page again (a fresh one-time link), for example after closing the window. |
-| `/voice status` | Phase, helper port, queued/running voice requests, whether the guard is active. |
+| `/talk on [name]` | Starts the helper and opens the voice page. `name` is the thread label (optional). |
+| `/talk off` | Stops the helper (and codex). Also happens when the session ends. |
+| `/talk page` | Opens the voice page again (a fresh one-time link), for example after closing the window. |
+| `/talk status` | Phase, helper port, queued/running voice requests, whether the guard is active. |
 
 On the voice page:
 
@@ -281,8 +284,8 @@ a silent track) and stops by itself.
 
 The label names the Claude Code thread the window talks to, so several voice windows can be told
 apart. It is shown in the window title and heading, and the voice model is told about it ("which
-thread is this?"). Give it with `/voice on <name>`, or rename it on the page. The label is
-remembered per Claude Code session (in the plugin's `$.store`), across `/voice off`, restarts and
+thread is this?"). Give it with `/talk on <name>`, or rename it on the page. The label is
+remembered per Claude Code session (in the plugin's `$.store`), across `/talk off`, restarts and
 resumes. Without one, the label is `<folder>・<first 4 characters of the session id>`. A rename
 reaches the voice model at the next **Start**.
 
@@ -334,7 +337,7 @@ speak** (for example Japanese or English). To give it a character, add a `person
 | `instructions` | none | Extra free text appended to the voice model's instructions. |
 | `previewText` | a one-sentence self-introduction | What the Preview button asks the model to say. |
 
-All fields are optional. The persona is read when the helper starts (`/voice off` then `/voice on`
+All fields are optional. The persona is read when the helper starts (`/talk off` then `/talk on`
 to apply a change). The persona only shapes the voice model; Claude Code itself receives a neutral
 `[voice] ...` prompt and answers in the language of the request.
 
@@ -366,7 +369,7 @@ Limits:
 - Reading and editing files is allowed. A misheard request can still change files.
 - A turn counts as voice-originated when its prompt carries the voice marker (a line starting
   with `[voice] ` plus the plugin's notice block), or is a text the plugin submitted, whatever
-  happened to the request meanwhile (timed out, `/voice off`).
+  happened to the request meanwhile (timed out, `/talk off`).
 - **A typed prompt that contains the full voice marker** (for example a pasted voice prompt) is
   guarded too: fail-safe by design. Retype the request without the marker to run it unguarded.
 - The guard's state (the running turn, which subagents belong to voice turns, the submitted
@@ -383,7 +386,7 @@ Limits:
   after that turn has ended (the transcript no longer shows a running voice turn, and the
   subagent's origin was never saved). So **while `guard NOT saved` is shown, do not reload or
   update the plugin and do not leave background work running**: wait until the warning clears, or
-  stop with `/voice off` and let running work finish under Claude's normal permission prompts.
+  stop with `/talk off` and let running work finish under Claude's normal permission prompts.
 - Subagents of voice turns are remembered for the whole session (never evicted), as long as the
   state can be saved (see above). Subagents of typed turns are remembered up to 500; one forgotten
   and seen again during a voice turn counts as voice.
@@ -393,21 +396,21 @@ Limits:
 
 | Symptom | What to check |
 | --- | --- |
-| `/voice on` says the helper exited at once | `uv` and `codex` on `PATH`? Run `uv run --script <plugin folder>\helper\voice_helper.py --help`. macOS: start Claude Code from a Terminal so it sees the Homebrew `PATH`. |
+| `/talk on` says the helper exited at once | `uv` and `codex` on `PATH`? Run `uv run --script <plugin folder>\helper\voice_helper.py --help`. macOS: start Claude Code from a Terminal so it sees the Homebrew `PATH`. |
 | `codex not found on PATH` | Install the codex CLI, or check `where codex` (macOS: `which codex`). |
 | `realtime state=error` / 401 / `unauthorized` | `codex login status` must show a ChatGPT login. Log in again. |
 | `realtime conversation requires API key auth` | The WebRTC transport was not used: your codex version may have changed the API. |
 | `AVAS realtime calls require realtime v1 or v3` | Only v1/v3 work over ChatGPT login (the default is v3). |
-| macOS: no window opens | Install Chrome, Edge, Brave or Chromium, or check that your default browser opens `http` links. Then `/voice page`. |
-| macOS: the microphone is silent or refused | System Settings → Privacy & Security → Microphone: allow your browser, restart it, then `/voice page`. |
+| macOS: no window opens | Install Chrome, Edge, Brave or Chromium, or check that your default browser opens `http` links. Then `/talk page`. |
+| macOS: the microphone is silent or refused | System Settings → Privacy & Security → Microphone: allow your browser, restart it, then `/talk page`. |
 | Page shows "failed" on Start | Microphone permission in the browser (Edge on Windows), default recording device, another app holding the mic. Open the page only via `127.0.0.1`. |
 | `media-failed` / `media lost` | A firewall or VPN may block UDP. |
 | No sound | Browser tab muted? Output device? |
 | The voice interrupts itself | Use a headset (echo). |
 | The voice answers by itself instead of delegating | Ask more concretely ("look at the files in..."); adjust `persona.instructions`. |
 | Answer not spoken | The status line says why (`answer not spoken: ...`); the page log shows `Result -> speech`. |
-| `voice: blocked: ...` / "Voice is blocked" on the page | MCP isolation could not be confirmed (see Architecture). Check the reason in the log; remove or fix the MCP server named there, then `/voice off` and `/voice on`. |
-| The page says "this link is used up" | The page opens only once per link. Run `/voice page`. |
+| `voice: blocked: ...` / "Voice is blocked" on the page | MCP isolation could not be confirmed (see Architecture). Check the reason in the log; remove or fix the MCP server named there, then `/talk off` and `/talk on`. |
+| The page says "this link is used up" | The page opens only once per link. Run `/talk page`. |
 | Anything else | `%LOCALAPPDATA%\claude-code-voice-mod\logs\voice-*.log` (macOS: `~/Library/Application Support/claude-code-voice-mod/logs/`) (metadata only by default; with debug logging, transcripts and requests are in it: review before sharing). |
 
 ## Development
@@ -463,7 +466,7 @@ fixed in the next release; see [CHANGELOG.md](CHANGELOG.md).
 
 | Round | Reviewed commit | Outcome |
 | --- | --- | --- |
-| 1 | `2dbfc29` (0.2.0) | Guard bypass after timeout/`/voice off`, unauthenticated local HTTP, MCP leak, unredacted answers. Fixed in 0.2.1. |
+| 1 | `2dbfc29` (0.2.0) | Guard bypass after timeout/`/talk off`, unauthenticated local HTTP, MCP leak, unredacted answers. Fixed in 0.2.1. |
 | 2 | `553e449` (0.2.1) | Mid-turn hot reload, token readable from the page, dotted MCP names, logging on by default, HTTP limits. Fixed in 0.3.0. |
 | 3 | `d3a47fa` (0.3.0) | Unsaved guard state lost on reload, stale answer re-sent into a new session, eviction after 500 agents. Fixed in 0.3.1. |
 | 4 | `deeac60` (0.3.1, tag `v0.3.1`) | Earlier fixes confirmed. Remaining: the two "known gaps while saving fails" listed under [Voice-origin guard](#voice-origin-guard). No real secrets, no unauthenticated remote code execution found. |

@@ -10,7 +10,7 @@ The codex realtime API is experimental: any of this can change.
 | Path | Role |
 | --- | --- |
 | `.claude-plugin/plugin.json` | The plugin `voice`. |
-| `hooks/register.ts` | `/voice on/off/page/status`, spawning the helper, the request queue, turn correlation, posting answers back, wiring the guard (saved in `$.state`), the thread label. |
+| `hooks/register.ts` | `/talk on/off/page/status`, spawning the helper, the request queue, turn correlation, posting answers back, wiring the guard (saved in `$.state`), the thread label. |
 | `types/index.d.ts` | The `$.state` contract: `voice.guard`, the guard's scope kept across a hot reload. |
 | `hooks/guard.ts` | The voice-origin guard: pure functions plus `VoiceScope`. |
 | `hooks/prompt.ts` | The `[voice] ...` prompt submitted to Claude Code. |
@@ -104,7 +104,7 @@ depend on them except for waiting on `session.started` before a preview.
    guarded does not depend on the queue: the voice marker (`[voice] ` at a line start plus the
    notice block, `hooks/prompt.ts`) or any text the plugin submitted (the last 50, kept in the
    session's `$.state`) is enough. So a voice prompt still queued in Claude Code after its request timed out or
-   after `/voice off` runs guarded; its answer is posted as `late` if the helper still runs, else
+   after `/talk off` runs guarded; its answer is posted as `late` if the helper still runs, else
    dropped. A typed prompt containing the whole marker is guarded too (fail-safe).
 4. The plugin posts `{id, answer, status, reason, turnId, durationMs}` to the helper's
    `POST /answer`. `status` is `ok`, `aborted`, `error`, `refusal`, `timeout` (10 minutes) or `late`.
@@ -141,7 +141,7 @@ guards that turn the same way. An empty transcript, or one ending in a final ans
 nothing, so a fresh typed session is never blocked; if the transcript cannot be read, the snapshot
 stands. A save advances the saved revision only once `$.state.set` succeeded; a failed save keeps
 the scope dirty, is retried at every hook entry (`turn.start`, `tool.call`, `agent.spawn`,
-`turn.complete`, `/voice status`) and shows `guard NOT saved (retrying)` in the status line and one
+`turn.complete`, `/talk status`) and shows `guard NOT saved (retrying)` in the status line and one
 toast until a save lands. If the `tool.call` guard itself fails before deciding, its catch handler
 denies the blocked kinds of calls whatever the turn.
 
@@ -152,7 +152,7 @@ is a few dozen bytes, so the snapshot grows by about 40 bytes per voice subagent
 
 ## Thread label
 
-`/voice on <name>` passes `--label` to the helper; the page can rename it (`POST /label`), and the
+`/talk on <name>` passes `--label` to the helper; the page can rename it (`POST /label`), and the
 helper reports the new name on stdout so the plugin stores it in `$.store` under the session id.
 The label goes into the page title and heading and into the voice prompt.
 
@@ -182,7 +182,7 @@ The label goes into the page title and heading and into the voice prompt.
   `127.0.0.1:<port>` or `localhost:<port>` (no DNS rebinding); an `Origin`, when present, must be
   exactly `http://127.0.0.1:<port>` or `http://localhost:<port>`. `GET /` needs `?k=<key>`, a
   one-time key (`secrets.token_urlsafe(32)`, valid once and for 5 minutes, never logged) that the
-  helper opens the browser with; `/voice page` (`POST /reopen`) mints a new one. The page then drops it
+  helper opens the browser with; `/talk page` (`POST /reopen`) mints a new one. The page then drops it
   from the address bar (`history.replaceState`). Every other path except `/favicon.ico` needs
   `X-Voice-Token`, a random per-run token (compared in constant time). The plugin gets it from the
   `ready` line; the page gets it embedded in a `<meta>` tag. No CORS headers are sent; responses

@@ -103,7 +103,7 @@ const SOURCE_LABEL = { cli:'--voice', settings:'saved', default:'codex default' 
 function showBlocked(reason) {
   const b = $('blocked');
   b.textContent = 'Voice is blocked: ' + (reason || 'MCP isolation not confirmed') +
-    '. No realtime session will start. See the README (MCP isolation), then run /voice off and /voice on.';
+    '. No realtime session will start. See the README (MCP isolation), then run /talk off and /talk on.';
   b.hidden = false;
   $('start').disabled = true; $('preview').disabled = true;
 }
